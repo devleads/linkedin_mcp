@@ -1,0 +1,48 @@
+# LinkedIn MCP Server - Docker Compose
+# Run with: docker-compose up -d
+#
+# Prerequisites:
+#   - External PostgreSQL database (set DATABASE_URL in .env)
+#   - Oxylabs proxy credentials (set in .env)
+
+services:
+  # Database Migration (runs first, then exits)
+  migration:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: linkedin-mcp-migration
+    env_file:
+      - .env
+    command: ["uv", "run", "alembic", "upgrade", "head"]
+    restart: "no"
+
+  # LinkedIn MCP Server
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: linkedin-mcp-server
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      # Docker-specific overrides
+      # Use headed mode with Xvfb virtual display (better anti-detection)
+      HEADLESS: "false"
+      # Xvfb: run Chrome headful inside a virtual display.
+      # Required for LinkedIn bot detection avoidance — headless Chrome is easily detected.
+      USE_XVFB: "1"
+      MCP_HOST: "0.0.0.0"
+      # Production logging
+      LOG_FORMAT: "json"
+      # Apify proxy (used when PROXY_PROVIDER=apify)
+      APIFY_PROXY_PASSWORD: ${APIFY_PROXY_PASSWORD:-}
+      APIFY_PROXY_GROUPS: ${APIFY_PROXY_GROUPS:-RESIDENTIAL}
+    ports:
+      - "8765:8765"
+    restart: unless-stopped
+    # Increase shared memory for Chromium
+    shm_size: 2gb
