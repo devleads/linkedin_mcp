@@ -40,6 +40,11 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional JSESSIONID cookie value",
                     },
+                    "cookies": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Optional list of all cookies in format [{\"name\": \"...\", \"value\": \"...\", \"domain\": \"...\"}, ...]. Export from browser DevTools: Application > Cookies > linkedin.com",
+                    },
                 },
                 "required": ["profile_id", "li_at"],
             },
@@ -168,6 +173,16 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "URL of the LinkedIn profile to view",
                     },
+                    "include_activity": {
+                        "type": "boolean",
+                        "description": "Whether to fetch recent posts and comments (default: false)",
+                        "default": False,
+                    },
+                    "max_posts": {
+                        "type": "integer",
+                        "description": "Maximum number of recent posts to fetch when include_activity is true (default: 5)",
+                        "default": 5,
+                    },
                 },
                 "required": ["profile_id", "linkedin_url"],
             },
@@ -249,8 +264,8 @@ async def list_tools() -> list[Tool]:
                     },
                     "scroll_count": {
                         "type": "integer",
-                        "description": "Number of times to scroll for more content (default: 5)",
-                        "default": 5,
+                        "description": "Number of times to scroll for more content (default: 3)",
+                        "default": 3,
                     },
                 },
                 "required": ["profile_id", "keywords"],
@@ -433,6 +448,54 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["profile_id", "recipient_url"],
+            },
+        ),
+        Tool(
+            name="create_post",
+            description="Create a personal post on LinkedIn.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "profile_id": {
+                        "type": "string",
+                        "description": "Profile identifier",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Post text content",
+                    },
+                    "image_path": {
+                        "type": "string",
+                        "description": "Optional path to image file to attach",
+                    },
+                },
+                "required": ["profile_id", "content"],
+            },
+        ),
+        Tool(
+            name="create_company_post",
+            description="Create a post on behalf of a company page (requires admin access).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "profile_id": {
+                        "type": "string",
+                        "description": "Profile identifier (must have admin access to the company)",
+                    },
+                    "company_url": {
+                        "type": "string",
+                        "description": "LinkedIn company page URL",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Post text content",
+                    },
+                    "image_path": {
+                        "type": "string",
+                        "description": "Optional path to image file to attach",
+                    },
+                },
+                "required": ["profile_id", "company_url", "content"],
             },
         ),
     ]
