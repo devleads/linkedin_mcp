@@ -39,6 +39,7 @@ Remote Client / MCP Client
 | Endpoint | Method | Description |
 |---|---|---|
 | `/health` | GET | Health check |
+| `/mcp` | POST | Standard MCP Streamable HTTP transport for AI agents |
 | `/tools` | GET | List tools |
 | `/call` | POST | Execute MCP tool |
 
@@ -75,6 +76,7 @@ curl -X POST http://localhost:8765/call \
 - `like_and_comment_post`
 - `read_messages`
 - `send_message`
+- `send_inbox_message`
 - `send_connection_request`
 - `create_post`
 - `create_company_post`
@@ -84,15 +86,16 @@ curl -X POST http://localhost:8765/call \
 | Variable | Description | Default |
 |---|---|---|
 | `DATABASE_URL` | PostgreSQL URL | `postgresql://linkedin:linkedin@localhost:5432/linkedin` |
-| `PROXY_PROVIDER` | Active proxy provider (`oxylabs` or `ipfoxy`) | `oxylabs` |
+| `PROXY_PROVIDER` | Proxy backend for profiles with a country (`oxylabs`, `ipfoxy`, or `apify`) | `oxylabs` |
 | `OXYLABS_USERNAME` | Required when `PROXY_PROVIDER=oxylabs` | - |
 | `OXYLABS_PASSWORD` | Required when `PROXY_PROVIDER=oxylabs` | - |
 | `OXYLABS_PROXY_TYPE` | `mobile` or `residentials` | `mobile` |
 | `OXYLABS_RESIDENTIAL_HOST` | Oxylabs residential host | `pr.oxylabs.io` |
 | `HEADLESS` | Browser headless mode | `false` |
-| `PROFILE_STORAGE_PATH` | Browser state root path | `./data/browser_state` |
+| `BROWSER_PROFILE_ROOT` | Persistent browser state root | `./data/browser_state` |
 | `MCP_HOST` | Bind host for HTTP server | `0.0.0.0` |
 | `MCP_PORT` | Bind port for HTTP server | `8765` |
+| `MCP_API_KEY` | Bearer or X-API-Key credential required for non-loopback HTTP binding | - |
 
 ## Database Schema (High Level)
 
@@ -173,3 +176,8 @@ linkedin-mcp/
   }
 }
 ```
+
+Remote MCP clients can connect to `http://localhost:8765/mcp`. When
+`MCP_API_KEY` is configured, send it as either `Authorization: Bearer <key>` or
+`X-API-Key: <key>`. The `/tools` and `/call` endpoints remain available for
+legacy REST clients.

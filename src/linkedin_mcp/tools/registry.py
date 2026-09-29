@@ -60,6 +60,39 @@ INTEGER_ARGUMENTS = {
     "max_messages_per_conversation",
 }
 
+ARGUMENT_DESCRIPTIONS = {
+    "profile_id": "UUID of the LinkedIn account profile that will perform the action.",
+    "li_at": "LinkedIn li_at authentication cookie value.",
+    "jsessionid": "Optional LinkedIn JSESSIONID cookie value.",
+    "cookies": "Optional browser cookies as objects containing at least name and value.",
+    "email": "LinkedIn login email; omit to use the stored profile email.",
+    "password": "LinkedIn login password; omit to use the stored profile password.",
+    "totp_code": "Current two-factor authentication code when LinkedIn requests one.",
+    "url": "Absolute URL to open; defaults to the LinkedIn home page.",
+    "max_posts": "Maximum number of posts to return.",
+    "scroll_count": "Maximum number of feed or search result scrolls.",
+    "linkedin_url": "Absolute LinkedIn member profile URL.",
+    "include_activity": "Include recent activity in the member profile response.",
+    "company_url": "Absolute LinkedIn company page URL.",
+    "keywords": "Search terms. Post search accepts an array of individual terms.",
+    "country": "Optional ISO 3166-1 alpha-2 country filter for people search.",
+    "connection_degree": "Optional LinkedIn connection-degree filters such as ['1', '2', '3'].",
+    "page": "One-based search result page number.",
+    "max_results": "Maximum number of search results to return.",
+    "post_url": "Absolute LinkedIn post URL.",
+    "comment_text": "Comment text to publish.",
+    "max_conversations": "Maximum conversations to return; zero uses the tool default range.",
+    "max_messages_per_conversation": "Maximum recent messages returned for each conversation.",
+    "recipient_url": "Absolute LinkedIn member profile URL for the recipient.",
+    "message": "Message text to send.",
+    "conversation_id": "Existing LinkedIn inbox conversation identifier.",
+    "participant_profile_url": "LinkedIn member URL used to locate or compose the conversation.",
+    "existing_thread_only": "Require an existing conversation instead of creating a new thread.",
+    "note": "Optional connection-request note, limited by LinkedIn to 300 characters.",
+    "content": "Text content to publish in the post.",
+    "image_path": "Optional absolute path to an image available on the MCP server filesystem.",
+}
+
 
 @dataclass(frozen=True)
 class ToolSpec:
@@ -83,6 +116,9 @@ class ToolSpec:
                 schema = {"type": "integer"}
             else:
                 schema = {"type": "string"}
+            description = ARGUMENT_DESCRIPTIONS.get(argument)
+            if description:
+                schema["description"] = description
             if argument in self.optional and self.optional[argument] is not None:
                 schema["default"] = self.optional[argument]
             properties[argument] = schema
@@ -91,7 +127,18 @@ class ToolSpec:
                 "type": "string",
                 "description": "Stable caller key used to prevent duplicate writes",
             }
-        return {"type": "object", "properties": properties, "required": list(self.required)}
+        schema = {
+            "type": "object",
+            "properties": properties,
+            "required": list(self.required),
+            "additionalProperties": False,
+        }
+        if self.name == "send_inbox_message":
+            schema["anyOf"] = [
+                {"required": ["conversation_id"]},
+                {"required": ["participant_profile_url"]},
+            ]
+        return schema
 
     def as_mcp_tool(self) -> Tool:
         return Tool(name=self.name, description=self.description, inputSchema=self.input_schema())

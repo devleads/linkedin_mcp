@@ -22,15 +22,22 @@ import time
 from collections import defaultdict, deque
 from aiohttp import web
 from aiohttp.web import middleware
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.transport_security import TransportSecuritySettings
 
 from linkedin_mcp.dispatcher import dispatch_tool, get_tool_names
 from linkedin_mcp.browser.session import get_session_manager
 from linkedin_mcp.config import get_settings, setup_logging
+from linkedin_mcp.server import server as mcp_server
 
 # Configure logging at module load
 setup_logging()
 logger = logging.getLogger(__name__)
 RATE_LIMIT_EVENTS_KEY = web.AppKey("rate_limit_events", dict)
+MCP_SESSION_MANAGER_KEY = web.AppKey(
+    "mcp_session_manager", StreamableHTTPSessionManager
+)
+MCP_MANAGER_CONTEXT_KEY = web.AppKey("mcp_manager_context", object)
 
 
 def _allowed_origins() -> set[str]:
@@ -182,11 +189,100 @@ async def handle_list_tools(request: web.Request) -> web.Response:
     })
 
 
+async def handle_mcp(request: web.Request) -> web.Response:
+    """Bridge an aiohttp request to the SDK's standard MCP Streamable HTTP transport."""
+    try:
+        body = await request.read()
+    except web.HTTPRequestEntityTooLarge:
+        return web.json_response(
+            {"status": "error", "code": "REQUEST_TOO_LARGE", "message": "Request body is too large"},
+            status=413,
+        )
+
+    request_sent = False
+    response_status = 500
+    response_headers: list[tuple[bytes, bytes]] = []
+    response_body = bytearray()
+
+    async def receive() -> dict:
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict) -> None:
+        nonlocal response_status, response_headers
+        if message["type"] == "http.response.start":
+            response_status = message["status"]
+            response_headers = list(message.get("headers", []))
+        elif message["type"] == "http.response.body":
+            response_body.extend(message.get("body", b""))
+
+    peer = request.transport.get_extra_info("peername") if request.transport else None
+    server_address = request.transport.get_extra_info("sockname") if request.transport else None
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": f"{request.version.major}.{request.version.minor}",
+        "method": request.method,
+        "scheme": request.scheme,
+        "path": request.path,
+        "raw_path": request.raw_path.split("?", 1)[0].encode("ascii", errors="ignore"),
+        "query_string": request.query_string.encode("ascii", errors="ignore"),
+        "root_path": "",
+        "headers": [
+            (name.lower().encode("latin-1"), value.encode("latin-1"))
+            for name, value in request.headers.items()
+        ],
+        "client": peer,
+        "server": server_address,
+        "state": {},
+    }
+    await request.app[MCP_SESSION_MANAGER_KEY].handle_request(scope, receive, send)
+
+    excluded = {b"content-length", b"transfer-encoding", b"connection"}
+    headers = {
+        name.decode("latin-1"): value.decode("latin-1")
+        for name, value in response_headers
+        if name.lower() not in excluded
+    }
+    return web.Response(status=response_status, headers=headers, body=bytes(response_body))
+
+
+def _create_mcp_session_manager() -> StreamableHTTPSessionManager:
+    settings = get_settings()
+    allowed_hosts = ["127.0.0.1:*", "localhost:*", "host.docker.internal:*"]
+    if settings.mcp_host not in {"0.0.0.0", "::", "127.0.0.1", "localhost"}:
+        allowed_hosts.append(f"{settings.mcp_host}:*")
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=sorted(_allowed_origins()),
+    )
+    return StreamableHTTPSessionManager(
+        app=mcp_server,
+        json_response=True,
+        stateless=True,
+        security_settings=security,
+        max_request_body_size=settings.http_max_request_bytes,
+    )
+
+
+async def on_startup(app: web.Application) -> None:
+    manager_context = app[MCP_SESSION_MANAGER_KEY].run()
+    await manager_context.__aenter__()
+    app[MCP_MANAGER_CONTEXT_KEY] = manager_context
+
+
 async def on_shutdown(app: web.Application):
     """Cleanup on shutdown."""
     logger.info("Shutting down, closing all sessions...")
     session_manager = get_session_manager()
     await session_manager.close_all()
+    manager_context = app.get(MCP_MANAGER_CONTEXT_KEY)
+    if manager_context is not None:
+        await manager_context.__aexit__(None, None, None)
 
 
 def create_app() -> web.Application:
@@ -197,10 +293,13 @@ def create_app() -> web.Application:
         client_max_size=get_settings().http_max_request_bytes,
     )
     app[RATE_LIMIT_EVENTS_KEY] = defaultdict(deque)
+    app[MCP_SESSION_MANAGER_KEY] = _create_mcp_session_manager()
     app.router.add_get("/health", handle_health)
     app.router.add_get("/tools", handle_list_tools)
     app.router.add_post("/call", handle_tool_call)
+    app.router.add_route("*", "/mcp", handle_mcp)
     app.router.add_route("OPTIONS", "/call", handle_tool_call)  # CORS preflight
+    app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     return app
 
