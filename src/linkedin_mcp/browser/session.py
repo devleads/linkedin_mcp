@@ -434,6 +434,7 @@ class SessionManager:
                 proxy_username=proxy_username,
                 proxy_password=proxy_password,
                 headless=self.settings.headless,
+                browser_channel=self.settings.browser_channel,
             )
             
             # Store profile db id for cookie operations

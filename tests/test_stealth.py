@@ -1,9 +1,13 @@
 """Unit tests for browser stealth args and init scripts."""
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
+from linkedin_mcp.browser.stealth import BrowserConfig, StealthBrowser
 from linkedin_mcp.browser.stealth_args import STEALTH_ARGS, DOCKER_ONLY_ARGS, get_stealth_args
 from linkedin_mcp.browser.stealth_init import build_stealth_init_script
+from linkedin_mcp.models.profile import ProfileFingerprint
 
 
 class TestStealthArgs:
@@ -73,11 +77,11 @@ class TestStealthInitScript:
         assert isinstance(script, str)
         assert len(script) > 100
 
-    def test_contains_webdriver_patch(self):
-        """Should patch navigator.webdriver."""
+    def test_preserves_native_webdriver_surface(self):
+        """Should not create a detectable own navigator.webdriver property."""
         script = build_stealth_init_script()
         assert "webdriver" in script
-        assert "undefined" in script
+        assert "Object.defineProperty(navigator, 'webdriver'" not in script
 
     def test_contains_platform(self):
         """Should include the platform value."""
@@ -105,10 +109,12 @@ class TestStealthInitScript:
         script = build_stealth_init_script()
         assert "toDataURL" in script
 
-    def test_contains_plugins_patch(self):
-        """Should patch navigator.plugins."""
+    def test_preserves_native_plugin_array(self):
+        """Should not replace Chrome's PluginArray with a plain array."""
         script = build_stealth_init_script()
         assert "plugins" in script
+        assert "Object.defineProperty(navigator, 'plugins'" not in script
+        assert "get: () => [1, 2, 3, 4, 5]" not in script
 
     def test_contains_chrome_object(self):
         """Should add window.chrome object."""
@@ -132,3 +138,36 @@ class TestStealthInitScript:
         script = build_stealth_init_script()
         assert "(function()" in script
         assert ")();" in script
+
+
+@pytest.mark.asyncio
+async def test_legacy_runtime_uses_installed_chrome_channel():
+    """The Docker image installs Chrome, so legacy launch must select that channel."""
+    fingerprint = ProfileFingerprint(user_agent="test-agent", platform="Linux x86_64")
+    runtime = StealthBrowser(
+        BrowserConfig(
+            profile_id="profile",
+            fingerprint=fingerprint,
+            timezone="UTC",
+            browser_channel="chrome",
+        )
+    )
+    page = MagicMock()
+    context = MagicMock()
+    context.add_init_script = AsyncMock()
+    context.new_page = AsyncMock(return_value=page)
+    context.close = AsyncMock()
+    browser = MagicMock()
+    browser.new_context = AsyncMock(return_value=context)
+    browser.close = AsyncMock()
+    playwright = MagicMock()
+    playwright.chromium.launch = AsyncMock(return_value=browser)
+    playwright.stop = AsyncMock()
+    starter = MagicMock()
+    starter.start = AsyncMock(return_value=playwright)
+
+    with patch("linkedin_mcp.browser.stealth.async_playwright", return_value=starter):
+        await runtime.start()
+        _, kwargs = playwright.chromium.launch.call_args
+        assert kwargs["channel"] == "chrome"
+        await runtime.stop()

@@ -19,6 +19,11 @@
           canvas: canvas.toDataURL(),
           viewport: [innerWidth, innerHeight],
           screen: [screen.width, screen.height],
+          webdriver: navigator.webdriver,
+          webdriverOwn: Object.prototype.hasOwnProperty.call(navigator, "webdriver"),
+          pluginsNativeType: navigator.plugins instanceof PluginArray,
+          pluginsLength: navigator.plugins.length,
+          firstPluginType: navigator.plugins.length ? navigator.plugins[0].toString() : null,
         };
       }
       window.browserProbe = snapshot;

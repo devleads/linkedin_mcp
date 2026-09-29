@@ -79,7 +79,10 @@ class PersistentChromeRuntime(StealthBrowser):
         self._acquire_profile_lock()
         try:
             self._playwright = await async_playwright().start()
-            args = ["--disable-dev-shm-usage"]
+            args = [
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ]
             if self.settings.browser_disable_sandbox:
                 args.append("--no-sandbox")
 

@@ -33,6 +33,7 @@ class BrowserConfig:
     proxy_password: Optional[str] = field(default=None, repr=False)
     headless: bool = False  # Default: NOT headless (safer for LinkedIn)
     locale: str = "en-US"
+    browser_channel: str = "chrome"
 
 
 class StealthBrowser:
@@ -88,6 +89,7 @@ class StealthBrowser:
             args = get_stealth_args(headless=self.config.headless, is_docker=is_docker)
             
             launch_options = {
+                "channel": self.config.browser_channel,
                 "headless": self.config.headless,
                 "args": args,
             }
@@ -162,8 +164,8 @@ class StealthBrowser:
         
         Injects a comprehensive init script that patches browser APIs
         to hide automation signals:
-        - navigator.webdriver → undefined
-        - navigator.plugins → fake array
+        - navigator.webdriver remains native and automation-controlled is disabled
+        - navigator.plugins remains Chrome's native PluginArray
         - navigator.platform → match fingerprint
         - window.chrome → { runtime: {} }
         - WebGL vendor/renderer spoofing

@@ -5,9 +5,7 @@ does not handle at the binary level. They are injected via `add_init_script`
 on the browser context BEFORE any page is created.
 
 Patches applied:
-- navigator.webdriver → undefined
 - navigator.languages → ['en-US', 'en']
-- navigator.plugins → fake array
 - navigator.platform → match fingerprint
 - window.chrome → { runtime: {} }
 - Permissions API → returns Notification.permission for 'notifications'
@@ -35,28 +33,16 @@ def build_stealth_init_script(
     """
     return f"""
     (function() {{
-        // ── navigator.webdriver → undefined ──
-        // Removes the primary automation detection flag.
-        try {{
-            Object.defineProperty(navigator, 'webdriver', {{
-                get: () => undefined,
-                configurable: true,
-            }});
-        }} catch(e) {{}}
+        // Keep navigator.webdriver and navigator.plugins native. Patchright
+        // plus --disable-blink-features=AutomationControlled provides the
+        // correct webdriver value without creating an own property, while
+        // Chrome's native PluginArray preserves its prototype and Plugin
+        // entries. Replacing either surface is itself detectable.
 
         // ── navigator.languages ──
         try {{
             Object.defineProperty(navigator, 'languages', {{
                 get: () => ['en-US', 'en'],
-                configurable: true,
-            }});
-        }} catch(e) {{}}
-
-        // ── navigator.plugins → fake array ──
-        // Real Chrome reports 5 plugin entries; automation reports 0.
-        try {{
-            Object.defineProperty(navigator, 'plugins', {{
-                get: () => [1, 2, 3, 4, 5],
                 configurable: true,
             }});
         }} catch(e) {{}}

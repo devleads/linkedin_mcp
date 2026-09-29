@@ -35,5 +35,10 @@ async def test_native_chrome_surfaces_are_stable_across_reload(tmp_path):
             assert "Headless" not in first["userAgent"]
             assert first["languages"]
             assert first["timezone"] == "UTC"
+            assert first["webdriver"] is False
+            assert first["webdriverOwn"] is False
+            assert first["pluginsNativeType"] is True
+            assert first["pluginsLength"] > 0
+            assert first["firstPluginType"] == "[object Plugin]"
         finally:
             await context.close()

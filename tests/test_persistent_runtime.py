@@ -75,6 +75,7 @@ async def test_start_uses_native_persistent_context_without_identity_overrides(t
         _, kwargs = playwright.chromium.launch_persistent_context.call_args
         assert kwargs["channel"] == "chrome"
         assert kwargs["no_viewport"] is True
+        assert "--disable-blink-features=AutomationControlled" in kwargs["args"]
         assert "user_agent" not in kwargs
         assert "viewport" not in kwargs
         assert "is_mobile" not in kwargs
