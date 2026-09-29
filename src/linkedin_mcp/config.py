@@ -50,10 +50,6 @@ class Settings(BaseSettings):
         description="Apify proxy group (RESIDENTIAL, DATACENTER, etc.)",
     )
     
-    # Deprecated compatibility setting. Runtime routing is controlled solely by
-    # proxy_provider; named providers always fail closed.
-    proxy_required: bool = Field(default=True, description="Deprecated; use PROXY_PROVIDER")
-    
     # Browser settings
     headless: bool = Field(default=False, description="Run browser in headless mode (NOT recommended)")
     

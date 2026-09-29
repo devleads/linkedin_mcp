@@ -89,7 +89,6 @@ curl -X POST http://localhost:8765/call \
 | `OXYLABS_PASSWORD` | Required when `PROXY_PROVIDER=oxylabs` | - |
 | `OXYLABS_PROXY_TYPE` | `mobile` or `residentials` | `mobile` |
 | `OXYLABS_RESIDENTIAL_HOST` | Oxylabs residential host | `pr.oxylabs.io` |
-| `PROXY_REQUIRED` | Enforce proxy use | `true` |
 | `HEADLESS` | Browser headless mode | `false` |
 | `PROFILE_STORAGE_PATH` | Browser state root path | `./data/browser_state` |
 | `MCP_HOST` | Bind host for HTTP server | `0.0.0.0` |

@@ -23,7 +23,6 @@ class TestSettings:
         assert settings.database_url == "postgresql://linkedin:linkedin@localhost:5432/linkedin"
         assert settings.proxy_provider == "oxylabs"
         assert settings.headless is False
-        assert settings.proxy_required is True
         assert settings.mcp_host == "127.0.0.1"
         assert settings.browser_runtime == "legacy_injected"
         assert settings.mcp_port == 8765

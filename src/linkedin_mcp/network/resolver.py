@@ -25,7 +25,10 @@ class NetworkRouteResolver:
 
     def resolve(self, profile: Any) -> NetworkRoute:
         provider = self.settings.proxy_provider
-        if provider == "none":
+        # A profile without a country is explicitly configured for a direct
+        # connection (see migration 003), even when other profiles use the
+        # globally selected proxy provider.
+        if provider == "none" or not getattr(profile, "country", None):
             return NetworkRoute(
                 kind="direct",
                 provider="none",

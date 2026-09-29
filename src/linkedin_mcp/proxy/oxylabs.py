@@ -300,8 +300,7 @@ class OxylabsProxy:
         Raises:
             ProxyNotAvailableError: If proxy is not configured
         """
-        if self.settings.proxy_required:
-            self._validate_config()
+        self._validate_config()
         
         host, resolved_port = self._resolve_endpoint(country, port)
         server = f"http://{host}:{resolved_port}"

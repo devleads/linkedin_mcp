@@ -23,11 +23,26 @@ def test_direct_route_does_not_initialize_provider(tmp_path):
     provider.assert_not_called()
 
 
+def test_profile_without_country_uses_direct_route(tmp_path):
+    settings = Settings(
+        _env_file=None,
+        proxy_provider="apify",
+        apify_proxy_password="proxy-password",
+        browser_profile_root=tmp_path,
+    )
+    profile = SimpleNamespace(country=None, state=None, city=None)
+    with patch("linkedin_mcp.network.resolver.get_proxy_dict_for_profile") as provider:
+        route = NetworkRouteResolver(settings).resolve(profile)
+    assert route.kind == "direct"
+    assert route.provider == "none"
+    assert route.as_browser_proxy() is None
+    provider.assert_not_called()
+
+
 def test_named_provider_failure_never_falls_back(tmp_path):
     settings = Settings(
         _env_file=None,
         proxy_provider="oxylabs",
-        proxy_required=False,
         browser_profile_root=tmp_path,
     )
     with patch(
