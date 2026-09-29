@@ -6,7 +6,7 @@
 # LinkedIn bot detection avoidance — headless Chrome is easily detected.
 #
 # The DISPLAY env var is set to :99 and exported to the Python process.
-# If Xvfb fails to start, falls back to headless mode automatically.
+# If Xvfb fails to start, startup fails rather than changing browser identity.
 
 set -e
 
@@ -21,9 +21,8 @@ if [ "${USE_XVFB:-1}" = "1" ]; then
 
   # Verify Xvfb is running.
   if ! kill -0 "$XVFB_PID" 2>/dev/null; then
-    echo "[entrypoint] ERROR: Xvfb failed to start. Falling back to headless mode."
-    unset DISPLAY
-    export HEADLESS=true
+    echo "[entrypoint] ERROR: Xvfb failed to start." >&2
+    exit 1
   else
     echo "[entrypoint] Xvfb started (PID $XVFB_PID, DISPLAY=$DISPLAY)"
   fi

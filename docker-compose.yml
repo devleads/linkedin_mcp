@@ -36,13 +36,22 @@ services:
       # Required for LinkedIn bot detection avoidance — headless Chrome is easily detected.
       USE_XVFB: "1"
       MCP_HOST: "0.0.0.0"
+      MCP_API_KEY: ${MCP_API_KEY:?MCP_API_KEY is required for HTTP access}
+      BROWSER_RUNTIME: ${BROWSER_RUNTIME:-legacy_injected}
+      BROWSER_CHANNEL: ${BROWSER_CHANNEL:-chrome}
+      BROWSER_PROFILE_ROOT: /app/data/browser_state
       # Production logging
       LOG_FORMAT: "json"
       # Apify proxy (used when PROXY_PROVIDER=apify)
       APIFY_PROXY_PASSWORD: ${APIFY_PROXY_PASSWORD:-}
       APIFY_PROXY_GROUPS: ${APIFY_PROXY_GROUPS:-RESIDENTIAL}
     ports:
-      - "8765:8765"
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - linkedin-browser-state:/app/data/browser_state
     restart: unless-stopped
     # Increase shared memory for Chromium
     shm_size: 2gb
+
+volumes:
+  linkedin-browser-state:

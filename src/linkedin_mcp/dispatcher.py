@@ -6,6 +6,11 @@ This eliminates code duplication between server.py and http_server.py.
 
 from contextlib import asynccontextmanager
 from typing import Any, List
+import logging
+import uuid
+import hashlib
+import hmac
+import json
 
 from linkedin_mcp.browser.session import get_session_manager
 from linkedin_mcp.challenge_lock import (
@@ -14,8 +19,20 @@ from linkedin_mcp.challenge_lock import (
 )
 from linkedin_mcp.config import get_settings
 from linkedin_mcp.db import get_db
-from linkedin_mcp.db.repository import ProfileRepository, ChallengeEventRepository
+from linkedin_mcp.db.repository import (
+    ActionLedgerRepository,
+    ProfileRepository,
+    ChallengeEventRepository,
+)
 from linkedin_mcp.tools import auth, feed, profile, messages
+from linkedin_mcp.domain.results import ErrorCode, error_result
+from linkedin_mcp.activity_policy import get_activity_policy
+from linkedin_mcp.tools.registry import LEDGER_TOOLS, WRITE_TOOLS
+
+
+logger = logging.getLogger(__name__)
+CHALLENGE_SAFE_TOOLS = frozenset({"get_session_status", "save_session_cookies", "close_session"})
+ACTIVITY_EXEMPT_TOOLS = CHALLENGE_SAFE_TOOLS | frozenset({"set_cookies", "login", "open_manual_browser"})
 
 
 # Tool registry - maps tool names to their handlers and argument specs
@@ -246,6 +263,70 @@ def _get_active_lock_for_profile(profile_db_id: int, db=None):
         )
 
 
+def _hash_action_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    serialized = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    key = get_settings().linkedin_credential_encryption_key.encode("utf-8") or b"linkedin-mcp-action"
+    return hmac.new(key, serialized.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _prepare_write_ledger(
+    profile_db_id: int,
+    tool_name: str,
+    idempotency_key: str,
+    arguments: dict[str, Any],
+) -> str | None:
+    target = {
+        key: value
+        for key, value in arguments.items()
+        if key in {"post_url", "recipient_url", "company_url", "conversation_id", "participant_profile_url"}
+    }
+    payload = {
+        key: value
+        for key, value in arguments.items()
+        if key in {"message", "note", "content", "comment_text", "image_path"}
+    }
+    with get_db() as db:
+        repo = ActionLedgerRepository(db)
+        existing = repo.get(profile_db_id, tool_name, idempotency_key)
+        if existing and existing.state == "succeeded":
+            return "succeeded"
+        if existing and existing.state in {"executing", "unknown"}:
+            return existing.state
+        row = existing or repo.prepare(
+            profile_db_id,
+            tool_name,
+            idempotency_key,
+            target_identity_hash=_hash_action_value(target) if target else None,
+            payload_hash=_hash_action_value(payload) if payload else None,
+        )
+        repo.transition(row, "executing")
+    return None
+
+
+def _finish_write_ledger(
+    profile_db_id: int,
+    tool_name: str,
+    idempotency_key: str,
+    result: Any,
+) -> None:
+    with get_db() as db:
+        repo = ActionLedgerRepository(db)
+        row = repo.get(profile_db_id, tool_name, idempotency_key)
+        if not row:
+            return
+        if isinstance(result, dict) and result.get("status") == "ok":
+            result_identity = result.get("post_url") or result.get("id") or result.get("conversation_id")
+            repo.transition(row, "succeeded", result_identity=str(result_identity) if result_identity else None)
+            return
+        message = str(result.get("message") if isinstance(result, dict) else result).lower()
+        uncertain = _is_fatal_session_error(result) or any(
+            token in message for token in ("postcondition", "timed out", "timeout", "browser has been closed")
+        )
+        error_code = result.get("code") if isinstance(result, dict) else ErrorCode.INTERNAL_ERROR.value
+        repo.transition(row, "unknown" if uncertain else "failed", error_code=str(error_code or "TOOL_FAILED"))
+
 async def dispatch_tool(name: str, arguments: dict[str, Any]) -> dict:
     """Dispatch tool call to appropriate handler.
     
@@ -256,14 +337,29 @@ async def dispatch_tool(name: str, arguments: dict[str, Any]) -> dict:
     Returns:
         Tool result as dict
     """
+    operation_id = uuid.uuid4().hex
+    logger.info("tool_started", extra={"extra": {"operation_id": operation_id, "tool": name}})
+
     if name not in TOOLS:
-        return {
-            "status": "error",
-            "message": f"Unknown tool: {name}",
-        }
+        return error_result(ErrorCode.INVALID_REQUEST, f"Unknown tool: {name}")
     
     tool = TOOLS[name]
     handler = tool["handler"]
+    ledger_enabled = name in LEDGER_TOOLS
+    idempotency_key = str(arguments.get("idempotency_key") or operation_id) if isinstance(arguments, dict) else operation_id
+
+    if not isinstance(arguments, dict):
+        return error_result(ErrorCode.INVALID_REQUEST, "Tool arguments must be an object")
+
+    allowed_arguments = set(tool["required"]) | set(tool["optional"])
+    if ledger_enabled:
+        allowed_arguments.add("idempotency_key")
+    unknown_arguments = sorted(set(arguments) - allowed_arguments)
+    if unknown_arguments:
+        return error_result(
+            ErrorCode.INVALID_REQUEST,
+            f"Unknown argument(s): {', '.join(unknown_arguments)}",
+        )
     
     # Build kwargs from required and optional arguments
     kwargs = {}
@@ -271,10 +367,7 @@ async def dispatch_tool(name: str, arguments: dict[str, Any]) -> dict:
     # Add required arguments
     for arg in tool["required"]:
         if arg not in arguments:
-            return {
-                "status": "error",
-                "message": f"Missing required argument: {arg}",
-            }
+            return error_result(ErrorCode.INVALID_REQUEST, f"Missing required argument: {arg}")
         kwargs[arg] = arguments[arg]
     
     # Add optional arguments with defaults
@@ -284,14 +377,14 @@ async def dispatch_tool(name: str, arguments: dict[str, Any]) -> dict:
     profile_id = kwargs.get("profile_id")
     profile_db_id = None
 
-    if profile_id:
+    if profile_id and name not in ACTIVITY_EXEMPT_TOOLS:
         with get_db() as db:
             profile_repo = ProfileRepository(db)
             profile_row = profile_repo.get_by_uuid(profile_id)
             if profile_row:
                 profile_db_id = profile_row.id
                 active_lock = _get_active_lock_for_profile(profile_db_id, db)
-                if active_lock:
+                if active_lock and name not in CHALLENGE_SAFE_TOOLS:
                     return build_challenge_lock_response(profile_id=profile_id, lock_data=active_lock)
 
     operation_guard = (
@@ -301,39 +394,74 @@ async def dispatch_tool(name: str, arguments: dict[str, Any]) -> dict:
     )
 
     result: Any = None
+    ledger_started = False
+
+    if profile_id and name not in ACTIVITY_EXEMPT_TOOLS:
+        effect = "write" if name in WRITE_TOOLS else "read"
+        if not get_activity_policy().allow(profile_id, effect):
+            return error_result(
+                ErrorCode.ACTIVITY_LIMITED,
+                "Profile activity budget is exhausted; retry after the configured window",
+            )
 
     async with operation_guard:
+        if ledger_enabled and profile_db_id is not None:
+            prior_state = _prepare_write_ledger(
+                profile_db_id,
+                name,
+                idempotency_key,
+                arguments,
+            )
+            if prior_state == "succeeded":
+                return error_result(
+                    ErrorCode.DUPLICATE_ACTION,
+                    "This idempotency key already completed successfully",
+                )
+            if prior_state in {"executing", "unknown"}:
+                return error_result(
+                    ErrorCode.UNKNOWN_WRITE_OUTCOME,
+                    "The previous write may have executed and must be reconciled before retry",
+                )
+            ledger_started = True
+
         try:
             result = await handler(**kwargs)
         except Exception as exc:
-            result = {
-                "status": "error",
-                "message": str(exc),
-            }
+            logger.error(
+                "Tool handler failed (%s)",
+                type(exc).__name__,
+                extra={"extra": {"operation_id": operation_id, "tool": name}},
+            )
+            result = error_result(ErrorCode.INTERNAL_ERROR, "Tool execution failed")
 
         if _needs_auth_recovery(tool, profile_id) and _is_auth_related_error(result):
             if profile_db_id is not None:
                 active_lock = _get_active_lock_for_profile(profile_db_id)
                 if active_lock:
-                    return build_challenge_lock_response(profile_id=profile_id, lock_data=active_lock)
+                    locked_result = build_challenge_lock_response(profile_id=profile_id, lock_data=active_lock)
+                    if ledger_started:
+                        _finish_write_ledger(profile_db_id, name, idempotency_key, locked_result)
+                    return locked_result
 
             login_result = await auth.ensure_logged_in(profile_id=profile_id)
             if isinstance(login_result, dict) and login_result.get("status") == "ok":
                 try:
                     result = await handler(**kwargs)
                 except Exception as exc:
-                    result = {
-                        "status": "error",
-                        "message": str(exc),
-                    }
+                    logger.error(
+                        "Tool retry failed (%s)",
+                        type(exc).__name__,
+                        extra={"extra": {"operation_id": operation_id, "tool": name}},
+                    )
+                    result = error_result(ErrorCode.INTERNAL_ERROR, "Tool execution failed")
             else:
-                login_message = (
-                    login_result.get("message") if isinstance(login_result, dict) else str(login_result)
-                ) or "Login failed"
-                return {
-                    "status": "error",
-                    "message": f"Auth recovery failed: {login_message}",
-                }
+                recovery_result = error_result(
+                    ErrorCode.AUTH_REQUIRED,
+                    "Authentication recovery failed",
+                )
+                if ledger_started and profile_db_id is not None:
+                    _finish_write_ledger(profile_db_id, name, idempotency_key, recovery_result)
+                return recovery_result
 
     if profile_id and name != "close_session" and _is_fatal_session_error(result):
         try:
@@ -355,4 +483,17 @@ async def dispatch_tool(name: str, arguments: dict[str, Any]) -> dict:
                     details=challenge_event.get("details"),
                 )
 
+    if ledger_started and profile_db_id is not None:
+        _finish_write_ledger(profile_db_id, name, idempotency_key, result)
+
+    logger.info(
+        "tool_finished",
+        extra={
+            "extra": {
+                "operation_id": operation_id,
+                "tool": name,
+                "status": result.get("status") if isinstance(result, dict) else "unknown",
+            }
+        },
+    )
     return result

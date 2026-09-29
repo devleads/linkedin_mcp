@@ -24,7 +24,15 @@ class TestSettings:
         assert settings.proxy_provider == "oxylabs"
         assert settings.headless is False
         assert settings.proxy_required is True
+        assert settings.mcp_host == "127.0.0.1"
+        assert settings.browser_runtime == "legacy_injected"
         assert settings.mcp_port == 8765
+
+    def test_explicit_direct_route(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("PROXY_PROVIDER", "none")
+        settings = Settings()
+        assert settings.proxy_provider == "none"
 
     def test_env_override(self, env_test):
         """Settings should load from environment variables."""

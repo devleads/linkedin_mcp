@@ -170,6 +170,21 @@ class TestDispatchTool:
         assert "Missing required argument" in result["message"]
 
     @pytest.mark.asyncio
+    async def test_unknown_argument_fails_before_handler(self):
+        handler = AsyncMock(return_value={"status": "ok"})
+        with patch.dict(TOOLS, {
+            "test_tool": {
+                "handler": handler,
+                "required": [],
+                "optional": {},
+                "auth_recovery": False,
+            }
+        }):
+            result = await dispatch_tool("test_tool", {"unexpected": True})
+        assert result["code"] == "INVALID_REQUEST"
+        handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_optional_defaults_applied(self):
         """Should apply default values for optional arguments."""
         mock_handler = AsyncMock(return_value={"status": "ok"})
@@ -221,4 +236,46 @@ class TestDispatchTool:
                             result = await dispatch_tool("test_tool", {"profile_id": "uuid-1"})
 
         assert result["status"] == "error"
-        assert "browser crashed" in result["message"]
+        assert result["code"] == "INTERNAL_ERROR"
+        assert result["message"] == "Tool execution failed"
+        assert "browser crashed" not in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_close_session_bypasses_active_challenge_lock(self):
+        handler = AsyncMock(return_value={"status": "ok"})
+        profile_row = MagicMock(id=7)
+        lock = {"remaining_minutes": 10, "signal": "checkpoint"}
+        tool = {
+            "handler": handler,
+            "required": ["profile_id"],
+            "optional": {},
+            "auth_recovery": False,
+        }
+        with patch.dict(TOOLS, {"close_session": tool}):
+            with patch("linkedin_mcp.dispatcher.get_db") as get_db:
+                get_db.return_value.__enter__.return_value = MagicMock()
+                get_db.return_value.__exit__.return_value = False
+                with patch("linkedin_mcp.dispatcher.ProfileRepository") as profiles:
+                    profiles.return_value.get_by_uuid.return_value = profile_row
+                    with patch("linkedin_mcp.dispatcher.ChallengeEventRepository") as events:
+                        events.return_value.get_active_lock.return_value = lock
+                        result = await dispatch_tool("close_session", {"profile_id": "uuid-1"})
+        assert result == {"status": "ok"}
+        handler.assert_awaited_once_with(profile_id="uuid-1")
+
+    @pytest.mark.asyncio
+    async def test_safe_recovery_tool_bypasses_activity_budget(self):
+        handler = AsyncMock(return_value={"status": "ok"})
+        tool = {
+            "handler": handler,
+            "required": ["profile_id"],
+            "optional": {},
+            "auth_recovery": False,
+        }
+        denied_policy = MagicMock()
+        denied_policy.allow.return_value = False
+        with patch.dict(TOOLS, {"close_session": tool}):
+            with patch("linkedin_mcp.dispatcher.get_activity_policy", return_value=denied_policy):
+                result = await dispatch_tool("close_session", {"profile_id": "uuid-1"})
+        assert result == {"status": "ok"}
+        denied_policy.allow.assert_not_called()

@@ -40,3 +40,6 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+markers = [
+    "browser_integration: requires the production Chrome channel and display environment",
+]

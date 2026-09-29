@@ -29,7 +29,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from linkedin_mcp.db import get_db
-from linkedin_mcp.db.repository import ProfileRepository
+from linkedin_mcp.db.repository import BrowserRuntimeRepository, ProfileRepository
 from linkedin_mcp.config import get_settings
 from linkedin_mcp.proxy.oxylabs import get_proxy_provider
 
@@ -88,15 +88,16 @@ def create_profile(
     """
     import json
     
+    settings = get_settings()
     if fingerprint_json:
         fingerprint_data = json.loads(fingerprint_json)
+    elif settings.browser_runtime == "persistent_native":
+        fingerprint_data = None
     else:
         fingerprint_data = DEFAULT_FINGERPRINT.copy()
     
     with get_db() as db:
         profile_repo = ProfileRepository(db)
-        settings = get_settings()
-        
         # Check if profile already exists
         existing = profile_repo.get_by_uuid(profile_uuid)
         if existing:
@@ -140,6 +141,11 @@ def create_profile(
             timezone=timezone,
             fingerprint_data=fingerprint_data,
             totp_secret=totp_secret,
+        )
+        BrowserRuntimeRepository(db).upsert(
+            profile.id,
+            settings.browser_runtime,
+            "pending",
         )
         
         # Set li_at cookie if provided
@@ -246,7 +252,11 @@ def main():
             print(f"  Fingerprint: from stdin ✓")
     
     if not fingerprint_json:
-        print(f"  Fingerprint: default (clone later with clone_fingerprint.py)")
+        runtime = get_settings().browser_runtime
+        if runtime == "persistent_native":
+            print("  Fingerprint: native Chrome identity")
+        else:
+            print("  Fingerprint: legacy default (clone before use)")
     
     try:
         profile_data = create_profile(
@@ -283,7 +293,7 @@ def main():
         if li_at:
             print(f"  li_at cookie: set ✓")
         
-        if not fingerprint_json:
+        if not fingerprint_json and get_settings().browser_runtime == "legacy_injected":
             print(f"\n  Next: Clone your Chrome fingerprint:")
             print(f"    pbpaste | uv run python scripts/clone_fingerprint.py {profile_uuid}")
         

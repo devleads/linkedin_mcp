@@ -3,6 +3,7 @@
 from typing import Any
 
 from linkedin_mcp.config import get_settings
+from linkedin_mcp.security import decrypt_envelope
 from linkedin_mcp.proxy.oxylabs import (
     OxylabsProxy,
     ProxyConfig,
@@ -36,6 +37,9 @@ def get_proxy_dict_for_profile(profile: Any) -> dict:
     settings = get_settings()
     provider_name = settings.proxy_provider
 
+    if provider_name == "none":
+        raise ValueError("Direct mode does not have a proxy configuration")
+
     if provider_name == "ipfoxy":
         provider = get_ipfoxy_provider()
         proxy_cfg = _get_profile_proxy_config(profile, "ipfoxy")
@@ -43,7 +47,7 @@ def get_proxy_dict_for_profile(profile: Any) -> dict:
             host=getattr(proxy_cfg, "host", None),
             port=getattr(proxy_cfg, "port", None),
             username=getattr(proxy_cfg, "username", None),
-            password=getattr(proxy_cfg, "password", None),
+            password=decrypt_envelope(getattr(proxy_cfg, "password", None)),
         )
 
     if provider_name == "apify":
@@ -70,10 +74,13 @@ def get_proxy_dict_for_profile(profile: Any) -> dict:
         raise OxylabsProxyNotAvailableError("Profile is missing country for oxylabs proxy")
 
     profile_port = getattr(profile, "proxy_port", None)
-    resolved_port = profile_port if profile_port is not None else provider.generate_port_for_country(country)
+    if profile_port is None:
+        raise OxylabsProxyNotAvailableError(
+            "Profile is missing its persisted Oxylabs sticky port"
+        )
     return provider.get_proxy_dict(
         country,
-        resolved_port,
+        profile_port,
         state=getattr(profile, "state", None),
         city=getattr(profile, "city", None),
     )

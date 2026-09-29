@@ -1,22 +1,24 @@
 """Session management for browser instances."""
 
 import asyncio
-import base64
+import importlib.metadata
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse
 
 from linkedin_mcp.browser.stealth import StealthBrowser, BrowserConfig
+from linkedin_mcp.browser.persistent_runtime import PersistentChromeRuntime
 from linkedin_mcp.models.profile import ProfileFingerprint
 from linkedin_mcp.db import get_db
-from linkedin_mcp.db.repository import ProfileRepository, CookieRepository, BrowserStateRepository
-from linkedin_mcp.proxy import get_proxy_dict_for_profile, get_active_proxy_provider_name
-from linkedin_mcp.proxy.ipfoxy import ProxyNotAvailableError as IPFoxyProxyNotAvailableError
-from linkedin_mcp.proxy.oxylabs import ProxyNotAvailableError as OxylabsProxyNotAvailableError
-from linkedin_mcp.proxy.apify import ProxyNotAvailableError as ApifyProxyNotAvailableError
+from linkedin_mcp.db.repository import (
+    ProfileRepository,
+    CookieRepository,
+    BrowserStateRepository,
+    BrowserRuntimeRepository,
+)
+from linkedin_mcp.network import NetworkRouteResolver
 from linkedin_mcp.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,8 @@ class BrowserSession:
     profile_uuid: str
     profile_db_id: int
     browser: StealthBrowser
+    route_identity: str = ""
+    runtime_type: str = "legacy_injected"
     created_at: datetime = field(default_factory=datetime.utcnow)
     last_activity: datetime = field(default_factory=datetime.utcnow)
     
@@ -41,6 +45,12 @@ class BrowserSession:
             browser_cookies = await self.browser.get_cookies(
                 ["https://www.linkedin.com"]
             )
+
+            # Native Chrome owns its durable state after the one-time migration.
+            # Writing the same state back to PostgreSQL would create two writable
+            # sources of truth.
+            if self.runtime_type == "persistent_native":
+                return len(browser_cookies)
             
             with get_db() as db:
                 cookie_repo = CookieRepository(db)
@@ -79,6 +89,18 @@ class BrowserSession:
         await self.browser.stop()
         logger.info(f"[session] Closed browser for profile {self.profile_uuid[:8]}...")
 
+    def mark_runtime_verified(self) -> None:
+        """Mark native profile migration complete after account auth is verified."""
+        if self.runtime_type != "persistent_native":
+            return
+        with get_db() as db:
+            BrowserRuntimeRepository(db).upsert(
+                self.profile_db_id,
+                self.runtime_type,
+                "complete",
+                last_verified_at=datetime.utcnow(),
+            )
+
 
 class SessionManager:
     """Manages browser sessions for multiple profiles.
@@ -96,98 +118,57 @@ class SessionManager:
         self._sessions: dict[str, BrowserSession] = {}
         self._active_operations: dict[str, int] = {}
         self._operation_locks: dict[str, asyncio.Lock] = {}
+        self._creation_locks: dict[str, asyncio.Lock] = {}
         self._operation_owners: dict[str, Optional[asyncio.Task]] = {}
         self._operation_depths: dict[str, int] = {}
-        self._persistent_sessions: set[str] = set()
+        self._pinned_sessions: set[str] = set()
         self._lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
         self.settings = get_settings()
+        self._capacity = asyncio.BoundedSemaphore(self.settings.max_active_browser_sessions)
+        self._capacity_profiles: set[str] = set()
+        self._pending_starts = 0
     
     def _start_cleanup_task(self):
         """Start background task to clean up idle sessions."""
         if self._cleanup_task is None or self._cleanup_task.done():
             self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
-    async def _preflight_ipfoxy_http_proxy(
-        self,
-        proxy_server: str,
-        proxy_username: Optional[str],
-        proxy_password: Optional[str],
-        timeout_seconds: int = 8,
-    ) -> None:
-        """Fail fast for invalid/mismatched IPFoxy HTTP proxy settings.
+    @staticmethod
+    def _can_reuse_session(
+        session: BrowserSession,
+        expected_route_identity: str | None,
+        expected_runtime_type: str | None,
+    ) -> bool:
+        """Require both immutable route and runtime to match an active session."""
+        return bool(
+            session.browser.is_running()
+            and session.route_identity == expected_route_identity
+            and session.runtime_type == expected_runtime_type
+        )
 
-        This verifies the proxy endpoint speaks HTTP CONNECT and credentials are
-        accepted before launching browser context.
-        """
-        parsed = urlparse(proxy_server)
-        host = parsed.hostname
-        port = parsed.port
-        if not host or not port:
-            raise IPFoxyProxyNotAvailableError(
-                f"Invalid IPFoxy proxy endpoint: {proxy_server}"
-            )
-
-        reader = None
-        writer = None
+    async def _acquire_capacity(self, profile_uuid: str) -> None:
+        async with self._lock:
+            if self._pending_starts >= self.settings.max_pending_operations:
+                raise RuntimeError("Browser session capacity queue is full")
+            self._pending_starts += 1
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
-                timeout=timeout_seconds,
+            await asyncio.wait_for(
+                self._capacity.acquire(),
+                timeout=self.settings.session_start_timeout_seconds,
             )
-
-            request_lines = [
-                "CONNECT www.linkedin.com:443 HTTP/1.1",
-                "Host: www.linkedin.com:443",
-                "Proxy-Connection: Keep-Alive",
-            ]
-            if proxy_username and proxy_password:
-                token = base64.b64encode(
-                    f"{proxy_username}:{proxy_password}".encode("utf-8")
-                ).decode("ascii")
-                request_lines.append(f"Proxy-Authorization: Basic {token}")
-
-            payload = "\r\n".join(request_lines) + "\r\n\r\n"
-            writer.write(payload.encode("utf-8"))
-            await writer.drain()
-
-            raw = await asyncio.wait_for(reader.read(512), timeout=timeout_seconds)
-            if not raw:
-                raise IPFoxyProxyNotAvailableError(
-                    "IPFoxy proxy preflight failed: endpoint returned empty response"
-                )
-
-            response_head = raw.decode("latin-1", errors="ignore")
-            if not response_head.startswith("HTTP/"):
-                raise IPFoxyProxyNotAvailableError(
-                    "IPFoxy proxy protocol mismatch: configured as HTTP but endpoint does not "
-                    "speak HTTP CONNECT. Switch this proxy to HTTP protocol in IPFoxy dashboard."
-                )
-
-            status_line = response_head.splitlines()[0] if response_head.splitlines() else "HTTP response missing status"
-            if " 200 " in status_line:
-                return
-            if " 407 " in status_line:
-                raise IPFoxyProxyNotAvailableError(
-                    "IPFoxy proxy authentication failed (HTTP 407). Verify username/password "
-                    "for this profile in profile_proxy_configs."
-                )
-
-            raise IPFoxyProxyNotAvailableError(
-                f"IPFoxy proxy CONNECT failed: {status_line}"
-            )
-        except asyncio.TimeoutError:
-            raise IPFoxyProxyNotAvailableError(
-                "IPFoxy proxy preflight timed out. Endpoint unreachable or blocked."
-            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("Timed out waiting for browser session capacity") from exc
         finally:
-            if writer:
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-    
+            async with self._lock:
+                self._pending_starts -= 1
+        self._capacity_profiles.add(profile_uuid)
+
+    def _release_capacity(self, profile_uuid: str) -> None:
+        if profile_uuid in self._capacity_profiles:
+            self._capacity_profiles.remove(profile_uuid)
+            self._capacity.release()
+
     async def _cleanup_loop(self):
         """Background task to close idle sessions."""
         while True:
@@ -199,10 +180,7 @@ class SessionManager:
     
     async def _close_idle_sessions(self):
         """Close sessions that have been idle too long."""
-        # Use debug_delay if set, otherwise default to 5 minutes for production
-        idle_timeout = self.settings.browser_debug_delay
-        if idle_timeout <= 0:
-            idle_timeout = 300  # 5 minutes default for production
+        idle_timeout = self.settings.session_idle_timeout_seconds
         
         now = datetime.utcnow()
         to_close = []
@@ -210,7 +188,7 @@ class SessionManager:
         for profile_uuid, session in self._sessions.items():
             if self._active_operations.get(profile_uuid, 0) > 0:
                 continue
-            if profile_uuid in self._persistent_sessions:
+            if profile_uuid in self._pinned_sessions:
                 continue
             idle_seconds = (now - session.last_activity).total_seconds()
             if idle_seconds > idle_timeout:
@@ -297,6 +275,13 @@ class SessionManager:
                 operation_lock.release()
     
     async def create_session(self, profile_uuid: str, force_new: bool = False) -> BrowserSession:
+        """Serialize creation so one profile cannot launch two browsers."""
+        async with self._lock:
+            creation_lock = self._creation_locks.setdefault(profile_uuid, asyncio.Lock())
+        async with creation_lock:
+            return await self._create_session(profile_uuid, force_new=force_new)
+
+    async def _create_session(self, profile_uuid: str, force_new: bool = False) -> BrowserSession:
         """Get or create a browser session for a profile.
         
         Always ensures the returned session has a running browser.
@@ -313,15 +298,32 @@ class SessionManager:
         # Start cleanup task if not running
         self._start_cleanup_task()
         
-        # Reuse same-profile sessions by default.
-        # Only explicit force_new rotates the existing browser for that profile.
-        isolate = force_new
+        # Explicit force_new and configured request isolation both rotate the
+        # existing browser. The setting previously existed but was ignored.
+        isolate = force_new or self.settings.browser_isolate_sessions
 
         logger.info(
             f"[session] create_session called for {profile_uuid} "
             f"(isolate={isolate}, cfg.browser_isolate_sessions={self.settings.browser_isolate_sessions})"
         )
+
+        expected_route_identity: Optional[str] = None
+        expected_runtime_type: Optional[str] = None
+        candidate = self._sessions.get(profile_uuid)
+        if candidate and candidate.browser.is_running() and not isolate:
+            with get_db() as db:
+                profile = ProfileRepository(db).get_by_uuid(profile_uuid)
+                if not profile:
+                    raise ValueError(f"Profile {profile_uuid} not found")
+                expected_runtime_type = BrowserRuntimeRepository(db).effective_runtime(
+                    profile.id,
+                    self.settings.browser_runtime,
+                )
+                expected_route_identity = NetworkRouteResolver(self.settings).resolve(
+                    profile
+                ).route_identity
         
+        session_to_close: Optional[BrowserSession] = None
         async with self._lock:
             # Check if session already exists
             if profile_uuid in self._sessions:
@@ -330,25 +332,41 @@ class SessionManager:
                 # If isolation mode, close existing session first
                 if isolate:
                     logger.info(f"[session] Isolation mode: closing existing session for {profile_uuid[:8]}...")
-                    try:
-                        await session.save_cookies()
-                        await session.browser.stop()
-                    except Exception as e:
-                        logger.warning(f"[session] Error closing existing session: {e}")
                     del self._sessions[profile_uuid]
-                elif session.browser.is_running():
+                    self._pinned_sessions.discard(profile_uuid)
+                    session_to_close = session
+                elif self._can_reuse_session(
+                    session,
+                    expected_route_identity,
+                    expected_runtime_type,
+                ):
                     # Reuse existing session (non-isolation mode)
                     logger.info(f"[session] Reusing existing session for {profile_uuid[:8]}...")
                     session.touch()
                     return session
+                elif session.browser.is_running():
+                    logger.info(
+                        "[session] Route or runtime changed for %s; replacing active browser",
+                        profile_uuid[:8],
+                    )
+                    del self._sessions[profile_uuid]
+                    self._pinned_sessions.discard(profile_uuid)
+                    session_to_close = session
                 else:
                     # Browser died - clean up and recreate
                     logger.warning(f"[session] Browser closed for {profile_uuid[:8]}, recreating session...")
-                    try:
-                        await session.browser.close()
-                    except Exception:
-                        pass  # Browser already closed
                     del self._sessions[profile_uuid]
+                    self._pinned_sessions.discard(profile_uuid)
+                    session_to_close = session
+
+        if session_to_close:
+            try:
+                await session_to_close.save_cookies()
+                await session_to_close.browser.stop()
+            except Exception as exc:
+                logger.warning("[session] Error closing replaced session: %s", exc)
+            finally:
+                self._release_capacity(profile_uuid)
         
         # Load profile from database
         logger.info(f"[session] Loading profile from database...")
@@ -362,79 +380,48 @@ class SessionManager:
             
             logger.info(f"[session] Profile loaded: country={profile.country}, timezone={profile.timezone}")
             
-            if not profile.fingerprint:
-                logger.error(f"[session] Profile {profile_uuid} has no fingerprint")
-                raise ValueError(f"Profile {profile_uuid} has no fingerprint")
-            
-            logger.info(f"[session] Fingerprint loaded from DB: platform={profile.fingerprint.platform}, "
-                        f"screen={profile.fingerprint.screen_width}x{profile.fingerprint.screen_height}, "
-                        f"webgl_vendor={profile.fingerprint.webgl_vendor[:30] if profile.fingerprint.webgl_vendor else 'None'}..., "
-                        f"ua={profile.fingerprint.user_agent[:50]}...")
-            
-            # Get proxy configuration (only if country is set)
-            proxy_server = None
-            proxy_username = None
-            proxy_password = None
-            
-            provider_name = get_active_proxy_provider_name()
-            try:
-                if provider_name == "ipfoxy":
-                    logger.info(
-                        f"[session] Getting ipfoxy proxy for profile={profile_uuid[:8]}..."
-                    )
-                    proxy_config = get_proxy_dict_for_profile(profile)
-                    proxy_server = proxy_config["server"]
-                    proxy_username = proxy_config["username"]
-                    proxy_password = proxy_config["password"]
+            runtime_type = BrowserRuntimeRepository(db).effective_runtime(
+                profile.id,
+                self.settings.browser_runtime,
+            )
 
-                    if proxy_server.startswith("http://") or proxy_server.startswith("https://"):
-                        await self._preflight_ipfoxy_http_proxy(
-                            proxy_server=proxy_server,
-                            proxy_username=proxy_username,
-                            proxy_password=proxy_password,
-                        )
-                    logger.info(f"[session] Proxy: {proxy_server} (ipfoxy dedicated)")
-                elif provider_name == "apify":
-                    logger.info(
-                        f"[session] Getting apify proxy for country={profile.country}, "
-                        f"state={profile.state}..."
-                    )
-                    proxy_config = get_proxy_dict_for_profile(profile)
-                    proxy_server = proxy_config["server"]
-                    proxy_username = proxy_config["username"]
-                    proxy_password = proxy_config["password"]
-                    logger.info(f"[session] Proxy: {proxy_server} (apify residential)")
-                elif profile.country:
-                    logger.info(
-                        f"[session] Getting oxylabs proxy for country={profile.country}, "
-                        f"state={profile.state}, city={getattr(profile, 'city', None)}, port={profile.proxy_port}..."
-                    )
-                    proxy_config = get_proxy_dict_for_profile(profile)
-                    proxy_server = proxy_config["server"]
-                    proxy_username = proxy_config["username"]
-                    proxy_password = proxy_config["password"]
-                    logger.info(f"[session] Proxy: {proxy_server} (oxylabs)")
-                else:
-                    logger.info(f"[session] No country set - running WITHOUT proxy")
-            except (OxylabsProxyNotAvailableError, IPFoxyProxyNotAvailableError, ApifyProxyNotAvailableError) as e:
-                logger.error(f"[session] Proxy config error: {e}")
-                if self.settings.proxy_required:
-                    raise
-                logger.warning("[session] proxy_required=false, continuing without proxy")
+            if not profile.fingerprint and runtime_type == "legacy_injected":
+                logger.error(f"[session] Profile {profile_uuid} has no fingerprint")
+                raise ValueError(f"Profile {profile_uuid} has no fingerprint for legacy runtime")
+            
+            if profile.fingerprint:
+                logger.info(f"[session] Fingerprint loaded from DB: platform={profile.fingerprint.platform}, "
+                            f"screen={profile.fingerprint.screen_width}x{profile.fingerprint.screen_height}, "
+                            f"webgl_vendor={profile.fingerprint.webgl_vendor[:30] if profile.fingerprint.webgl_vendor else 'None'}..., "
+                            f"ua={profile.fingerprint.user_agent[:50]}...")
+            
+            route = NetworkRouteResolver(self.settings).resolve(profile)
+            proxy = route.as_browser_proxy() or {}
+            proxy_server = proxy.get("server")
+            proxy_username = proxy.get("username")
+            proxy_password = proxy.get("password")
+            logger.info(
+                "[session] Resolved %s route for profile=%s route=%s",
+                route.provider,
+                profile_uuid[:8],
+                route.route_identity[:12],
+            )
             
             # Build fingerprint for browser
-            fp = ProfileFingerprint(
-                user_agent=profile.fingerprint.user_agent,
-                platform=profile.fingerprint.platform,
-                screen_width=profile.fingerprint.screen_width,
-                screen_height=profile.fingerprint.screen_height,
-                color_depth=profile.fingerprint.color_depth,
-                hardware_concurrency=profile.fingerprint.hardware_concurrency,
-                device_memory=profile.fingerprint.device_memory,
-                languages=profile.fingerprint.languages,
-                webgl_vendor=profile.fingerprint.webgl_vendor,
-                webgl_renderer=profile.fingerprint.webgl_renderer,
-            )
+            fp = None
+            if profile.fingerprint:
+                fp = ProfileFingerprint(
+                    user_agent=profile.fingerprint.user_agent,
+                    platform=profile.fingerprint.platform,
+                    screen_width=profile.fingerprint.screen_width,
+                    screen_height=profile.fingerprint.screen_height,
+                    color_depth=profile.fingerprint.color_depth,
+                    hardware_concurrency=profile.fingerprint.hardware_concurrency,
+                    device_memory=profile.fingerprint.device_memory,
+                    languages=profile.fingerprint.languages,
+                    webgl_vendor=profile.fingerprint.webgl_vendor,
+                    webgl_renderer=profile.fingerprint.webgl_renderer,
+                )
             
             # Build browser config (strictly isolated per profile)
             # Browser state (cookies + localStorage) is persisted in the database
@@ -492,29 +479,77 @@ class SessionManager:
         
         # Create browser (outside db context)
         logger.info(f"[session] Starting browser...")
-        browser = StealthBrowser(browser_config)
-        await browser.start()
+        if runtime_type == "persistent_native":
+            browser = PersistentChromeRuntime(browser_config, self.settings)
+            should_migrate_state = not browser.was_initialized
+        else:
+            browser = StealthBrowser(browser_config)
+            should_migrate_state = True
+        await self._acquire_capacity(profile_uuid)
+        try:
+            await browser.start()
+        except Exception:
+            self._release_capacity(profile_uuid)
+            raise
         logger.info(f"[session] Browser started successfully")
         
-        # Inject stored cookies into browser
-        if stored_state:
-            # Restore full storage state (cookies + localStorage) from DB.
-            await browser.set_storage_state(stored_state)
-            logger.info(f"[session] Restored storage state from database")
-        elif cookies:
-            # Fallback: only restore cookies (legacy profiles without stored state)
-            await browser.set_cookies(cookies)
-            logger.info(f"[session] Injected {len(cookies)} cookies into browser")
+        try:
+            # Inject database state only into a legacy context or a new native
+            # profile. An initialized native directory remains authoritative.
+            if stored_state and should_migrate_state:
+                await browser.set_storage_state(stored_state)
+                logger.info(f"[session] Restored storage state from database")
+            elif cookies and should_migrate_state:
+                await browser.set_cookies(cookies)
+                logger.info(f"[session] Injected {len(cookies)} cookies into browser")
+            if runtime_type == "persistent_native" and should_migrate_state:
+                browser.mark_initialized({"runtime_type": runtime_type})
+        except Exception:
+            await browser.stop()
+            self._release_capacity(profile_uuid)
+            raise
+
+        if runtime_type == "persistent_native":
+            chrome_version = None
+            try:
+                patchright_version = importlib.metadata.version("patchright")
+            except importlib.metadata.PackageNotFoundError:
+                patchright_version = None
+            try:
+                user_agent = await browser.evaluate("navigator.userAgent")
+                marker = "Chrome/"
+                if marker in user_agent:
+                    chrome_version = user_agent.split(marker, 1)[1].split(" ", 1)[0]
+            except Exception:
+                logger.warning("[session] Could not record Chrome version")
+            with get_db() as db:
+                existing_runtime = BrowserRuntimeRepository(db).get(profile_db_id)
+                BrowserRuntimeRepository(db).upsert(
+                    profile_db_id,
+                    runtime_type,
+                    "validating" if not existing_runtime or existing_runtime.migration_status != "complete" else "complete",
+                    chrome_version=chrome_version,
+                    patchright_version=patchright_version,
+                    initialized_at=(
+                        datetime.utcnow()
+                        if should_migrate_state
+                        and not getattr(existing_runtime, "initialized_at", None)
+                        else getattr(existing_runtime, "initialized_at", None)
+                    ),
+                )
         
         # Create session
         session = BrowserSession(
             profile_uuid=profile_uuid,
             profile_db_id=profile_db_id,
             browser=browser,
+            route_identity=route.route_identity,
+            runtime_type=runtime_type,
         )
         
         # Store in cache
-        self._sessions[profile_uuid] = session
+        async with self._lock:
+            self._sessions[profile_uuid] = session
         
         logger.info(f"[session] Created session for profile {profile_uuid[:8]}...")
         return session
@@ -528,7 +563,7 @@ class SessionManager:
         if not session.browser.is_running():
             # Drop stale session entries so callers can create a fresh one.
             self._sessions.pop(profile_uuid, None)
-            self._persistent_sessions.discard(profile_uuid)
+            self._pinned_sessions.discard(profile_uuid)
             return None
 
         session.touch()
@@ -539,20 +574,25 @@ class SessionManager:
         async with self._lock:
             session = self._sessions.get(profile_uuid)
             if not session or not session.browser.is_running():
-                self._persistent_sessions.discard(profile_uuid)
+                self._pinned_sessions.discard(profile_uuid)
                 return False
 
             if persistent:
-                self._persistent_sessions.add(profile_uuid)
+                if (
+                    profile_uuid not in self._pinned_sessions
+                    and len(self._pinned_sessions) >= self.settings.max_pinned_browser_sessions
+                ):
+                    raise RuntimeError("Pinned browser session capacity is full")
+                self._pinned_sessions.add(profile_uuid)
             else:
-                self._persistent_sessions.discard(profile_uuid)
+                self._pinned_sessions.discard(profile_uuid)
 
             session.touch()
             return True
 
     def is_persistent(self, profile_uuid: str) -> bool:
         """Return whether profile session is pinned to stay open."""
-        return profile_uuid in self._persistent_sessions
+        return profile_uuid in self._pinned_sessions
     
     async def close_session(self, profile_uuid: str, force: bool = False) -> bool:
         """Close a browser session and save cookies.
@@ -572,33 +612,42 @@ class SessionManager:
             if not session:
                 return False
             
-            # Save cookies before closing
-            await session.save_cookies()
-            
-            # Stop browser
-            await session.browser.stop()
-            
-            # Remove from sessions
             del self._sessions[profile_uuid]
-            self._persistent_sessions.discard(profile_uuid)
-            
-            logger.info(f"[session] Closed session for profile {profile_uuid[:8]}...")
-            return True
+            self._pinned_sessions.discard(profile_uuid)
+
+        try:
+            await session.save_cookies()
+            await session.browser.stop()
+        finally:
+            self._release_capacity(profile_uuid)
+        logger.info(f"[session] Closed session for profile {profile_uuid[:8]}...")
+        return True
     
     async def close_all(self) -> None:
         """Close all active sessions."""
+        cleanup_task = self._cleanup_task
+        self._cleanup_task = None
+        if cleanup_task and cleanup_task is not asyncio.current_task():
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+
         async with self._lock:
-            for profile_uuid in list(self._sessions.keys()):
-                session = self._sessions[profile_uuid]
-                try:
-                    await session.save_cookies()
-                    await session.browser.stop()
-                except Exception as e:
-                    logger.error(f"[session] Error closing session {profile_uuid[:8]}: {e}")
-            
+            sessions = list(self._sessions.items())
             self._sessions.clear()
-            self._persistent_sessions.clear()
-            logger.info("[session] Closed all sessions")
+            self._pinned_sessions.clear()
+
+        for profile_uuid, session in sessions:
+            try:
+                await session.save_cookies()
+                await session.browser.stop()
+            except Exception as e:
+                logger.error(f"[session] Error closing session {profile_uuid[:8]}: {e}")
+            finally:
+                self._release_capacity(profile_uuid)
+        logger.info("[session] Closed all sessions")
     
     def list_sessions(self) -> list:
         """List all active session profile UUIDs."""

@@ -306,6 +306,14 @@ class TestProxyDispatch:
         assert "password" in d
         assert "us-pr.oxylabs.io" in d["server"]
 
+    def test_oxylabs_profile_without_sticky_port_fails_closed(self, env_test, mock_profile_row):
+        """Resolution must not invent a different route on each session lookup."""
+        from linkedin_mcp.proxy import get_proxy_dict_for_profile
+
+        mock_profile_row.proxy_port = None
+        with pytest.raises(OxylabsProxyNotAvailableError, match="sticky port"):
+            get_proxy_dict_for_profile(mock_profile_row)
+
     def test_get_proxy_dict_for_profile_apify(self, env_apify, mock_profile_row):
         """Should dispatch to Apify provider."""
         from linkedin_mcp.proxy import get_proxy_dict_for_profile

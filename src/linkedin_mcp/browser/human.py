@@ -89,7 +89,7 @@ class HumanBehavior:
         """
         delay_ms = random.randint(min_ms, max_ms)
         # 10% chance of a longer "reading" pause
-        if random.random() < 0.1:
+        if min_ms != max_ms and random.random() < 0.1:
             delay_ms += random.randint(600, 1800)
         await page.wait_for_timeout(delay_ms)
 

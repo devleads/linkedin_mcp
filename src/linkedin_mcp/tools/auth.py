@@ -9,7 +9,7 @@ from linkedin_mcp.browser.session import get_session_manager, BrowserSession
 from linkedin_mcp.browser.human import HumanBehavior
 from linkedin_mcp.db import get_db
 from linkedin_mcp.db.repository import ProfileRepository, CookieRepository
-from linkedin_mcp.security import decrypt_secret
+from linkedin_mcp.security import decrypt_envelope, decrypt_secret
 
 logger = logging.getLogger(__name__)
 
@@ -210,9 +210,10 @@ async def ensure_logged_in(
 
         if await _check_logged_in(session):
             browser_cookies = await session.browser.get_cookies(["https://www.linkedin.com"])
-            with get_db() as db:
-                cookie_repo = CookieRepository(db)
-                cookie_repo.set_from_playwright(session.profile_db_id, browser_cookies)
+            if session.runtime_type != "persistent_native":
+                with get_db() as db:
+                    cookie_repo = CookieRepository(db)
+                    cookie_repo.set_from_playwright(session.profile_db_id, browser_cookies)
 
             return {
                 "status": "ok",
@@ -256,7 +257,7 @@ def _load_profile_credentials(
             "status": "ok",
             "email": email or profile.linkedin_email,
             "password": password or decrypt_secret(profile.linkedin_password_encrypted),
-            "totp_secret": profile.totp_secret,
+            "totp_secret": decrypt_envelope(profile.totp_secret),
         }
 
 
@@ -437,6 +438,7 @@ async def _check_logged_in(session: BrowserSession) -> bool:
             """)
 
             if logged_in_dom:
+                session.mark_runtime_verified()
                 return True
 
         return False

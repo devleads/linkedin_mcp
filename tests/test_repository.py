@@ -18,12 +18,15 @@ from linkedin_mcp.db.models import (
     ProfileChallengeEvent,
     ProfileProxyConfig,
     ProfileBrowserState,
+    ProfileActionLedger,
 )
 from linkedin_mcp.db.repository import (
     ProfileRepository,
     CookieRepository,
     ChallengeEventRepository,
     BrowserStateRepository,
+    BrowserRuntimeRepository,
+    ActionLedgerRepository,
 )
 
 
@@ -264,7 +267,8 @@ class TestCookieRepository:
 
         cookie = cookie_repo.get_by_name(profile.id, "li_at")
         assert cookie is not None
-        assert cookie.value == "token123"
+        assert cookie.value != "token123"
+        assert cookie_repo.get_li_at(profile.id) == "token123"
 
     def test_update_existing_cookie(self, db_session, sample_fingerprint_data):
         """Should update existing cookie value."""
@@ -276,7 +280,8 @@ class TestCookieRepository:
         cookie_repo.set_cookie(profile_id=profile.id, name="li_at", value="new")
 
         cookie = cookie_repo.get_by_name(profile.id, "li_at")
-        assert cookie.value == "new"
+        assert cookie.value != "new"
+        assert cookie_repo.get_li_at(profile.id) == "new"
 
     def test_get_li_at(self, db_session, sample_fingerprint_data):
         """get_li_at should return the li_at value."""
@@ -487,6 +492,11 @@ class TestBrowserStateRepository:
         assert loaded is not None
         assert loaded["cookies"][0]["name"] == "li_at"
         assert loaded["origins"][0]["origin"] == "https://www.linkedin.com"
+        stored = db_session.query(ProfileBrowserState).filter(
+            ProfileBrowserState.profile_id == profile.id
+        ).one()
+        assert stored.storage_state["format"] == "fernet:v1"
+        assert '"value":"token"' not in str(stored.storage_state)
 
     def test_save_state_upsert(self, db_session, sample_fingerprint_data):
         """Should update existing state on re-save."""
@@ -524,3 +534,53 @@ class TestBrowserStateRepository:
         state_repo.save_state(profile.id, {"cookies": [], "origins": []})
         profile_repo.delete(profile)
         assert state_repo.get_state(profile.id) is None
+
+
+class TestBrowserRuntimeRepository:
+    def test_per_profile_override_and_migration_state(self, db_session, sample_fingerprint_data):
+        profile = ProfileRepository(db_session).create(
+            uuid="runtime-test-uuid",
+            linkedin_email="runtime@test.com",
+            linkedin_password=None,
+            country="US",
+            timezone="UTC",
+            fingerprint_data=sample_fingerprint_data,
+        )
+        repo = BrowserRuntimeRepository(db_session)
+        assert repo.effective_runtime(profile.id, "legacy_injected") == "legacy_injected"
+        row = repo.upsert(profile.id, "persistent_native", "validating", profile_path_version=1)
+        assert row.runtime_type == "persistent_native"
+        assert repo.effective_runtime(profile.id, "legacy_injected") == "persistent_native"
+
+
+class TestActionLedgerRepository:
+    def test_unknown_outcome_cannot_be_retried(self, db_session, sample_fingerprint_data):
+        profile = ProfileRepository(db_session).create(
+            uuid="ledger-test-uuid",
+            linkedin_email="ledger@test.com",
+            linkedin_password=None,
+            country="US",
+            timezone="UTC",
+            fingerprint_data=sample_fingerprint_data,
+        )
+        repo = ActionLedgerRepository(db_session)
+        row = repo.prepare(profile.id, "send_message", "request-1", "target", "payload")
+        repo.transition(row, "executing")
+        repo.transition(row, "unknown", error_code="SESSION_CLOSED")
+        with pytest.raises(ValueError, match="must be reconciled"):
+            repo.transition(row, "executing")
+
+    def test_prepare_is_idempotent(self, db_session, sample_fingerprint_data):
+        profile = ProfileRepository(db_session).create(
+            uuid="ledger-idempotent-uuid",
+            linkedin_email="ledger2@test.com",
+            linkedin_password=None,
+            country="US",
+            timezone="UTC",
+            fingerprint_data=sample_fingerprint_data,
+        )
+        repo = ActionLedgerRepository(db_session)
+        first = repo.prepare(profile.id, "like_post", "request-2")
+        second = repo.prepare(profile.id, "like_post", "request-2")
+        assert first.id == second.id
+        assert db_session.query(ProfileActionLedger).count() == 1

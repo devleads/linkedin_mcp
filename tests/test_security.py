@@ -3,7 +3,13 @@
 import pytest
 from cryptography.fernet import Fernet
 
-from linkedin_mcp.security import encrypt_secret, decrypt_secret, _credential_fernet
+from linkedin_mcp.security import (
+    decrypt_envelope,
+    decrypt_secret,
+    encrypt_envelope,
+    encrypt_secret,
+    _credential_fernet,
+)
 
 
 class TestEncryptDecrypt:
@@ -70,3 +76,12 @@ class TestEncryptDecrypt:
         encrypted = encrypt_secret(original)
         decrypted = decrypt_secret(encrypted)
         assert decrypted == original
+
+    def test_versioned_envelope_roundtrip(self, env_test):
+        encrypted = encrypt_envelope("cookie-value")
+        assert encrypted.startswith("fernet:v1:")
+        assert "cookie-value" not in encrypted
+        assert decrypt_envelope(encrypted) == "cookie-value"
+
+    def test_envelope_accepts_legacy_plaintext(self, env_test):
+        assert decrypt_envelope("legacy-value") == "legacy-value"

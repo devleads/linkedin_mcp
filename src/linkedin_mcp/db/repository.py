@@ -14,9 +14,11 @@ from linkedin_mcp.db.models import (
     ProfileCookie,
     ProfileChallengeEvent,
     ProfileBrowserState,
+    ProfileBrowserRuntime,
+    ProfileActionLedger,
     ESSENTIAL_COOKIES,
 )
-from linkedin_mcp.security import encrypt_secret
+from linkedin_mcp.security import decrypt_envelope, encrypt_envelope, encrypt_secret
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,7 @@ class ProfileRepository:
         linkedin_password: Optional[str],
         country: str,
         timezone: str,
-        fingerprint_data: dict,
+        fingerprint_data: Optional[dict],
         totp_secret: Optional[str] = None,
         proxy_port: Optional[int] = None,
         state: Optional[str] = None,
@@ -77,17 +79,18 @@ class ProfileRepository:
             city=city.strip().lower().replace(" ", "_") if city else None,
             proxy_port=proxy_port,
             timezone=timezone,
-            totp_secret=totp_secret,
+            totp_secret=encrypt_envelope(totp_secret),
         )
         self.db.add(profile)
         self.db.flush()  # Get profile.id
         
         # Create fingerprint with JSON blob
-        fingerprint = ProfileFingerprint(
-            profile_id=profile.id,
-            fingerprint_data=fingerprint_data,
-        )
-        self.db.add(fingerprint)
+        if fingerprint_data is not None:
+            fingerprint = ProfileFingerprint(
+                profile_id=profile.id,
+                fingerprint_data=fingerprint_data,
+            )
+            self.db.add(fingerprint)
 
         # Persist provider-specific proxy config in extensible table
         if ipfoxy_host and ipfoxy_port and ipfoxy_username and ipfoxy_password:
@@ -97,7 +100,7 @@ class ProfileRepository:
                 host=ipfoxy_host.strip(),
                 port=int(ipfoxy_port),
                 username=ipfoxy_username.strip(),
-                password=ipfoxy_password,
+                password=encrypt_envelope(ipfoxy_password),
                 is_active=True,
             )
             self.db.add(proxy_config)
@@ -171,7 +174,7 @@ class CookieRepository:
     def get_li_at(self, profile_id: int) -> Optional[str]:
         """Get li_at cookie value (main auth token)."""
         cookie = self.get_by_name(profile_id, "li_at")
-        return cookie.value if cookie else None
+        return decrypt_envelope(cookie.value) if cookie else None
     
     def has_auth(self, profile_id: int) -> bool:
         """Check if profile has authentication cookies."""
@@ -193,7 +196,7 @@ class CookieRepository:
         existing = self.get_by_name(profile_id, name)
         
         if existing:
-            existing.value = value
+            existing.value = encrypt_envelope(value)
             existing.domain = domain
             existing.path = path
             existing.secure = secure
@@ -208,7 +211,7 @@ class CookieRepository:
             cookie = ProfileCookie(
                 profile_id=profile_id,
                 name=name,
-                value=value,
+                value=encrypt_envelope(value),
                 domain=domain,
                 path=path,
                 secure=secure,
@@ -372,7 +375,15 @@ class BrowserStateRepository:
         row = self.db.query(ProfileBrowserState).filter(
             ProfileBrowserState.profile_id == profile_id
         ).first()
-        return row.storage_state if row else None
+        if not row:
+            return None
+        state = row.storage_state
+        if isinstance(state, dict) and state.get("format") == "fernet:v1":
+            import json
+
+            plaintext = decrypt_envelope(state.get("ciphertext"))
+            return json.loads(plaintext) if plaintext else None
+        return state
 
     def save_state(self, profile_id: int, storage_state: dict) -> None:
         """Insert or update the storage_state for a profile.
@@ -382,17 +393,23 @@ class BrowserStateRepository:
             storage_state: The Playwright storage_state dict containing
                            cookies and localStorage origins.
         """
+        import json
+
+        encrypted_state = {
+            "format": "fernet:v1",
+            "ciphertext": encrypt_envelope(json.dumps(storage_state, separators=(",", ":"))),
+        }
         existing = self.db.query(ProfileBrowserState).filter(
             ProfileBrowserState.profile_id == profile_id
         ).first()
 
         if existing:
-            existing.storage_state = storage_state
+            existing.storage_state = encrypted_state
             existing.updated_at = datetime.utcnow()
         else:
             row = ProfileBrowserState(
                 profile_id=profile_id,
-                storage_state=storage_state,
+                storage_state=encrypted_state,
             )
             self.db.add(row)
 
@@ -413,3 +430,109 @@ class BrowserStateRepository:
         self.db.delete(row)
         self.db.commit()
         return True
+
+
+class BrowserRuntimeRepository:
+    """Manage per-profile runtime selection and migration state."""
+
+    VALID_RUNTIMES = {"legacy_injected", "persistent_native"}
+    VALID_STATUSES = {"pending", "validating", "complete", "failed"}
+
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get(self, profile_id: int) -> Optional[ProfileBrowserRuntime]:
+        return self.db.query(ProfileBrowserRuntime).filter(
+            ProfileBrowserRuntime.profile_id == profile_id
+        ).first()
+
+    def effective_runtime(self, profile_id: int, default: str) -> str:
+        row = self.get(profile_id)
+        return row.runtime_type if row else default
+
+    def upsert(
+        self,
+        profile_id: int,
+        runtime_type: str,
+        migration_status: str,
+        **metadata,
+    ) -> ProfileBrowserRuntime:
+        if runtime_type not in self.VALID_RUNTIMES:
+            raise ValueError(f"Invalid browser runtime: {runtime_type}")
+        if migration_status not in self.VALID_STATUSES:
+            raise ValueError(f"Invalid migration status: {migration_status}")
+        row = self.get(profile_id)
+        if row is None:
+            row = ProfileBrowserRuntime(profile_id=profile_id)
+            self.db.add(row)
+        row.runtime_type = runtime_type
+        row.migration_status = migration_status
+        for field in (
+            "profile_path_version",
+            "chrome_version",
+            "patchright_version",
+            "initialized_at",
+            "last_verified_at",
+        ):
+            if field in metadata:
+                setattr(row, field, metadata[field])
+        self.db.flush()
+        return row
+
+
+class ActionLedgerRepository:
+    """Persist write intent so uncertain submissions are never retried blindly."""
+
+    VALID_STATES = {"prepared", "executing", "succeeded", "failed", "unknown"}
+
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get(self, profile_id: int, action_type: str, idempotency_key: str) -> Optional[ProfileActionLedger]:
+        return self.db.query(ProfileActionLedger).filter(
+            ProfileActionLedger.profile_id == profile_id,
+            ProfileActionLedger.action_type == action_type,
+            ProfileActionLedger.idempotency_key == idempotency_key,
+        ).first()
+
+    def prepare(
+        self,
+        profile_id: int,
+        action_type: str,
+        idempotency_key: str,
+        target_identity_hash: Optional[str] = None,
+        payload_hash: Optional[str] = None,
+    ) -> ProfileActionLedger:
+        existing = self.get(profile_id, action_type, idempotency_key)
+        if existing:
+            return existing
+        row = ProfileActionLedger(
+            profile_id=profile_id,
+            action_type=action_type,
+            idempotency_key=idempotency_key,
+            target_identity_hash=target_identity_hash,
+            payload_hash=payload_hash,
+            state="prepared",
+        )
+        self.db.add(row)
+        self.db.flush()
+        return row
+
+    def transition(
+        self,
+        row: ProfileActionLedger,
+        state: str,
+        result_identity: Optional[str] = None,
+        error_code: Optional[str] = None,
+    ) -> ProfileActionLedger:
+        if state not in self.VALID_STATES:
+            raise ValueError(f"Invalid action-ledger state: {state}")
+        if row.state == "unknown" and state == "executing":
+            raise ValueError("An unknown write outcome must be reconciled before retry")
+        row.state = state
+        row.result_identity = result_identity
+        row.sanitized_error_code = error_code
+        if state in {"succeeded", "failed", "unknown"}:
+            row.completed_at = datetime.utcnow()
+        self.db.flush()
+        return row

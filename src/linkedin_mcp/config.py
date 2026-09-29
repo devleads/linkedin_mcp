@@ -2,9 +2,10 @@
 
 import logging
 import sys
+from pathlib import Path
 from typing import Optional, Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, SecretStr
 
 
 class Settings(BaseSettings):
@@ -20,10 +21,10 @@ class Settings(BaseSettings):
         description="Fernet key for encrypting/decrypting LinkedIn profile credentials",
     )
     
-    # Proxy provider selection — choose one of: oxylabs, ipfoxy, apify
-    proxy_provider: Literal["oxylabs", "ipfoxy", "apify"] = Field(
+    # Proxy provider selection. "none" is an explicit direct connection.
+    proxy_provider: Literal["none", "oxylabs", "ipfoxy", "apify"] = Field(
         default="oxylabs",
-        description="Proxy provider backend (oxylabs, ipfoxy, or apify)",
+        description="Network route (none, oxylabs, ipfoxy, or apify)",
     )
 
     # Oxylabs credentials (required when PROXY_PROVIDER=oxylabs)
@@ -49,21 +50,51 @@ class Settings(BaseSettings):
         description="Apify proxy group (RESIDENTIAL, DATACENTER, etc.)",
     )
     
-    # Proxy requirement - must be True
-    proxy_required: bool = Field(default=True, description="Require proxy for all connections")
+    # Deprecated compatibility setting. Runtime routing is controlled solely by
+    # proxy_provider; named providers always fail closed.
+    proxy_required: bool = Field(default=True, description="Deprecated; use PROXY_PROVIDER")
     
     # Browser settings
     headless: bool = Field(default=False, description="Run browser in headless mode (NOT recommended)")
     
     # MCP Server
-    mcp_host: str = Field(default="0.0.0.0", description="MCP server host")
+    mcp_host: str = Field(default="127.0.0.1", description="MCP server host")
     mcp_port: int = Field(default=8765, description="MCP server port")
+    mcp_api_key: SecretStr = Field(default=SecretStr(""), description="API key required for remote HTTP access")
+    allowed_origins: str = Field(
+        default="",
+        description="Comma-separated HTTP CORS origin allowlist",
+    )
+    http_max_request_bytes: int = Field(default=1_048_576, ge=1024)
+    http_tool_timeout_seconds: int = Field(default=300, ge=1)
+    http_rate_limit_per_minute: int = Field(default=60, ge=1)
     
     # Browser debug delay (seconds to keep browser open after request, 0 for production)
     browser_debug_delay: int = Field(default=0, description="Seconds to keep browser open after request (0 for production)")
     
     # Browser isolation - if True, each request gets its own browser window (no session reuse)
     browser_isolate_sessions: bool = Field(default=False, description="Each request opens its own browser window")
+    session_idle_timeout_seconds: int = Field(default=300, ge=1)
+    session_start_timeout_seconds: int = Field(default=60, ge=1)
+    max_active_browser_sessions: int = Field(default=4, ge=1)
+    max_pending_operations: int = Field(default=20, ge=1)
+    max_pinned_browser_sessions: int = Field(default=2, ge=0)
+    max_profile_read_actions_per_hour: int = Field(default=0, ge=0)
+    max_profile_write_actions_per_hour: int = Field(default=0, ge=0)
+    browser_runtime: Literal["legacy_injected", "persistent_native"] = Field(
+        default="legacy_injected",
+        description="Browser identity and persistence implementation",
+    )
+    browser_channel: str = Field(default="chrome")
+    browser_profile_root: Path = Field(default=Path("./data/browser_state"))
+    browser_disable_sandbox: bool = Field(
+        default=False,
+        description="Disable Chrome sandbox only when required by the container runtime",
+    )
+    assisted_recovery_enabled: bool = Field(
+        default=False,
+        description="Allow bounded read-only model assistance after deterministic resolution fails",
+    )
 
     # Challenge lock cooldown
     challenge_cooldown_minutes: int = Field(

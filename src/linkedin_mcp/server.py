@@ -10,6 +10,7 @@ from mcp.types import Tool, TextContent
 
 from linkedin_mcp.dispatcher import dispatch_tool
 from linkedin_mcp.browser.session import get_session_manager
+from linkedin_mcp.tools.registry import get_tool_specs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,6 +22,10 @@ server = Server("linkedin-mcp")
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     """List available LinkedIn MCP tools."""
+    return [spec.as_mcp_tool() for spec in get_tool_specs().values()]
+
+    # Legacy inline schemas remain below for one compatibility release while
+    # parity tests validate the canonical registry.
     return [
         Tool(
             name="set_cookies",
@@ -509,11 +514,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     try:
         result = await dispatch_tool(name, arguments)
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
-    except Exception as e:
-        logger.error(f"Tool {name} failed: {e}")
+    except Exception as exc:
+        logger.error("Tool %s failed (%s)", name, type(exc).__name__)
         return [TextContent(type="text", text=json.dumps({
             "status": "error",
-            "message": str(e),
+            "code": "INTERNAL_ERROR",
+            "message": "Tool execution failed",
         }))]
 
 

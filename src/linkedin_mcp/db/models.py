@@ -16,6 +16,7 @@ from sqlalchemy import (
     JSON,
     Index,
     UniqueConstraint,
+    CheckConstraint,
 )
 from sqlalchemy.orm import relationship
 
@@ -36,7 +37,7 @@ class Profile(Base):
     city = Column(String(96), nullable=True)  # Optional city targeting (e.g., los_angeles)
     proxy_port = Column(Integer, nullable=True)  # Oxylabs sticky session port (10000-49999)
     timezone = Column(String(50), nullable=True)  # IANA timezone
-    totp_secret = Column(String(64), nullable=True)  # For 2FA
+    totp_secret = Column(Text, nullable=True)  # Versioned encrypted 2FA secret
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -47,6 +48,8 @@ class Profile(Base):
     challenge_events = relationship("ProfileChallengeEvent", back_populates="profile", cascade="all, delete-orphan")
     proxy_configs = relationship("ProfileProxyConfig", back_populates="profile", cascade="all, delete-orphan")
     browser_state = relationship("ProfileBrowserState", back_populates="profile", uselist=False, cascade="all, delete-orphan")
+    browser_runtime = relationship("ProfileBrowserRuntime", back_populates="profile", uselist=False, cascade="all, delete-orphan")
+    action_ledger_entries = relationship("ProfileActionLedger", back_populates="profile", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Profile(uuid={self.uuid}, email={self.linkedin_email}, country={self.country})>"
@@ -146,9 +149,11 @@ class ProfileCookie(Base):
     
     def to_playwright_cookie(self) -> dict:
         """Convert to Playwright/Patchright cookie format."""
+        from linkedin_mcp.security import decrypt_envelope
+
         cookie = {
             "name": self.name,
-            "value": self.value,
+            "value": decrypt_envelope(self.value) or "",
             "domain": self.domain,
             "path": self.path,
             "secure": self.secure,
@@ -162,10 +167,12 @@ class ProfileCookie(Base):
     @classmethod
     def from_playwright_cookie(cls, profile_id: int, cookie: dict) -> "ProfileCookie":
         """Create from Playwright/Patchright cookie."""
+        from linkedin_mcp.security import encrypt_envelope
+
         return cls(
             profile_id=profile_id,
             name=cookie["name"],
-            value=cookie["value"],
+            value=encrypt_envelope(cookie["value"]),
             domain=cookie.get("domain", ".linkedin.com"),
             path=cookie.get("path", "/"),
             secure=cookie.get("secure", True),
@@ -258,6 +265,73 @@ class ProfileBrowserState(Base):
 
     def __repr__(self):
         return f"<ProfileBrowserState(profile_id={self.profile_id})>"
+
+
+class ProfileBrowserRuntime(Base):
+    """Per-profile browser runtime selection and migration state."""
+
+    __tablename__ = "profile_browser_runtimes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    profile_id = Column(Integer, ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, unique=True)
+    runtime_type = Column(String(32), nullable=False, default="legacy_injected")
+    profile_path_version = Column(Integer, nullable=False, default=1)
+    migration_status = Column(String(32), nullable=False, default="pending")
+    chrome_version = Column(String(64), nullable=True)
+    patchright_version = Column(String(64), nullable=True)
+    initialized_at = Column(DateTime, nullable=True)
+    last_verified_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    profile = relationship("Profile", back_populates="browser_runtime")
+
+    __table_args__ = (
+        CheckConstraint(
+            "runtime_type IN ('legacy_injected', 'persistent_native')",
+            name="ck_profile_browser_runtime_type",
+        ),
+        CheckConstraint(
+            "migration_status IN ('pending', 'validating', 'complete', 'failed')",
+            name="ck_profile_browser_migration_status",
+        ),
+    )
+
+
+class ProfileActionLedger(Base):
+    """Durable intent and outcome record for LinkedIn write actions."""
+
+    __tablename__ = "profile_action_ledger"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    profile_id = Column(Integer, ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    action_type = Column(String(64), nullable=False)
+    idempotency_key = Column(String(128), nullable=False)
+    target_identity_hash = Column(String(64), nullable=True)
+    payload_hash = Column(String(64), nullable=True)
+    state = Column(String(16), nullable=False, default="prepared")
+    result_identity = Column(String(255), nullable=True)
+    sanitized_error_code = Column(String(64), nullable=True)
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id",
+            "action_type",
+            "idempotency_key",
+            name="uq_profile_action_idempotency",
+        ),
+        Index("ix_profile_action_ledger_profile_started", "profile_id", "started_at"),
+        CheckConstraint(
+            "state IN ('prepared', 'executing', 'succeeded', 'failed', 'unknown')",
+            name="ck_profile_action_ledger_state",
+        ),
+    )
+
+    profile = relationship("Profile", back_populates="action_ledger_entries")
 
 
 # Essential LinkedIn cookies to preserve

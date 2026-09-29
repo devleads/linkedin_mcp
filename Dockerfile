@@ -56,15 +56,20 @@ COPY . .
 # Install Python dependencies
 RUN uv sync --frozen
 
-# Install Patchright browsers (Chromium)
-RUN uv run patchright install chromium
+# Install the real Chrome channel used by the persistent runtime.
+RUN uv run patchright install chrome
 
-# Create data directories
-RUN mkdir -p /app/data/browser_state
+# Create an unprivileged service account and its durable browser profile root.
+RUN groupadd --system linkedin-mcp \
+    && useradd --system --gid linkedin-mcp --home-dir /app linkedin-mcp \
+    && mkdir -p /app/data/browser_state \
+    && chown -R linkedin-mcp:linkedin-mcp /app
 
 # Copy entrypoint script that starts Xvfb before the Python process.
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
 RUN chmod +x ./docker-entrypoint.sh
+
+USER linkedin-mcp
 
 # Expose MCP server port
 EXPOSE 8765

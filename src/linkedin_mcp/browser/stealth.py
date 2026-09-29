@@ -3,7 +3,9 @@
 import asyncio
 import logging
 import random
-from dataclasses import dataclass
+import json
+import hashlib
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 
 from patchright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
@@ -12,6 +14,9 @@ from linkedin_mcp.browser.human import HumanBehavior
 from linkedin_mcp.browser.stealth_args import get_stealth_args
 from linkedin_mcp.browser.stealth_init import build_stealth_init_script
 from linkedin_mcp.browser.navigation import goto_with_retry
+from linkedin_mcp.browser.interaction import InteractionController
+from linkedin_mcp.linkedin.page_state import PageState, classify_page_state
+from linkedin_mcp.linkedin.pages.base import observe_page
 from linkedin_mcp.models.profile import ProfileFingerprint
 
 logger = logging.getLogger(__name__)
@@ -21,11 +26,11 @@ logger = logging.getLogger(__name__)
 class BrowserConfig:
     """Configuration for stealth browser instance."""
     profile_id: str
-    fingerprint: ProfileFingerprint
+    fingerprint: Optional[ProfileFingerprint]
     timezone: str  # IANA timezone, e.g., "America/New_York"
     proxy_server: Optional[str] = None
-    proxy_username: Optional[str] = None
-    proxy_password: Optional[str] = None
+    proxy_username: Optional[str] = field(default=None, repr=False)
+    proxy_password: Optional[str] = field(default=None, repr=False)
     headless: bool = False  # Default: NOT headless (safer for LinkedIn)
     locale: str = "en-US"
 
@@ -51,6 +56,11 @@ class StealthBrowser:
         self._page: Optional[Page] = None
         self._started = False
         self.human = HumanBehavior()
+        seed = int.from_bytes(
+            hashlib.sha256(config.profile_id.encode("utf-8")).digest()[:8],
+            "big",
+        )
+        self.interaction = InteractionController(seed=seed)
         self._last_mouse_position: Optional[tuple[float, float]] = None
     
     async def start(self) -> bool:
@@ -84,10 +94,9 @@ class StealthBrowser:
             
             # Log proxy status
             if self.config.proxy_server:
-                logger.info(f"Proxy server: {self.config.proxy_server}")
-                logger.info(f"Proxy username: {self.config.proxy_username[:20]}..." if self.config.proxy_username else "No proxy username")
+                logger.info("Starting browser with configured proxy route")
             else:
-                logger.info("Running WITHOUT proxy (profile.country is null)")
+                logger.info("Starting browser with direct network route")
             
             # Launch browser with WebRTC disabled
             self._browser = await self._playwright.chromium.launch(**launch_options)
@@ -96,6 +105,8 @@ class StealthBrowser:
             # ignore_https_errors and java_script_enabled are set explicitly
             # to ensure consistent behavior across environments.
             fp = self.config.fingerprint
+            if fp is None:
+                raise ValueError("legacy_injected runtime requires a stored fingerprint")
             context_options = {
                 "viewport": {
                     "width": fp.screen_width,
@@ -168,6 +179,8 @@ class StealthBrowser:
         
         # Build the stealth init script with the profile's fingerprint values.
         fp = self.config.fingerprint
+        if fp is None:
+            raise ValueError("legacy_injected runtime requires a stored fingerprint")
         platform = fp.platform or "MacIntel"
         webgl_vendor = fp.webgl_vendor or "Intel Inc."
         webgl_renderer = fp.webgl_renderer or "Intel Iris OpenGL Engine"
@@ -231,12 +244,22 @@ class StealthBrowser:
             response = await goto_with_retry(
                 self._page, url, wait_until=wait_until, timeout=timeout
             )
+            self.interaction.navigation_completed()
             
             await self.human.page_load_delay()
-            
-            # Simulate idle mouse movement and scroll after page load,
-            # mimicking a real user scanning the page after it renders.
-            await self.human.human_mouse_and_scroll(self._page)
+
+            observation = await observe_page(
+                self._page,
+                self.interaction.state.page_revision,
+            )
+            page_state = classify_page_state(observation)
+            if page_state in {
+                PageState.AUTH_WALL,
+                PageState.CHECKPOINT,
+                PageState.CAPTCHA,
+                PageState.RATE_LIMIT,
+            }:
+                raise RuntimeError(f"{page_state.value} detected")
             
             # Check for redirect loops or auth issues
             final_url = self._page.url
@@ -342,31 +365,7 @@ class StealthBrowser:
         if not self._page:
             raise RuntimeError("Browser not started")
 
-        await self.human.action_delay()
-
-        # 30% chance of idle mouse movement before clicking,
-        # simulating a user glancing at other content first.
-        if random.random() < 0.3:
-            await self.human.human_mouse_and_scroll(self._page)
-
-        try:
-            await locator.scroll_into_view_if_needed(timeout=3000)
-        except Exception:
-            pass
-
-        box = await locator.bounding_box()
-        if not box:
-            return False
-
-        target_x, target_y = self._pick_target_point(box)
-        await self._move_mouse_humanly(target_x, target_y)
-        await self.human.hover_delay()
-        await self._page.mouse.down()
-        await asyncio.sleep(self.human.click_hold_ms() / 1000)
-        await self._page.mouse.up()
-        self._last_mouse_position = (target_x, target_y)
-        await self.human.post_click_delay()
-        return True
+        return await self.interaction.click(self._page, locator)
 
     async def _move_mouse_humanly(self, target_x: float, target_y: float) -> None:
         """Move mouse to target using curved, step-based path."""
@@ -399,15 +398,18 @@ class StealthBrowser:
         if not self._page:
             raise RuntimeError("Browser not started")
         
-        return await self.human.human_type(self._page, selector, text)
+        return await self.interaction.type_text(
+            self._page,
+            self._page.locator(selector).first,
+            text,
+        )
     
     async def scroll(self, pixels: int) -> None:
         """Scroll page with human-like behavior."""
         if not self._page:
             raise RuntimeError("Browser not started")
         
-        await self.human.scroll_delay()
-        await self._page.evaluate(f"window.scrollBy(0, {pixels})")
+        await self.interaction.scroll_toward(self._page, pixels)
     
     async def scroll_down(self, amount: str = "page") -> int:
         """Scroll down with natural variance and human pause. Returns 0 if page navigated.
@@ -553,14 +555,13 @@ class StealthBrowser:
             for item in items:
                 key = item.get("name", "")
                 value = item.get("value", "")
-                # Escape for safe JS string embedding
-                escaped_key = key.replace("\\", "\\\\").replace("'", "\\'")
-                escaped_value = value.replace("\\", "\\\\").replace("'", "\\'")
-                js_items.append(f"localStorage.setItem('{escaped_key}', '{escaped_value}');")
+                js_items.append(
+                    f"localStorage.setItem({json.dumps(key)}, {json.dumps(value)});"
+                )
             js_code = f"""
             (function() {{
                 try {{
-                    if (window.location.origin === '{origin}') {{
+                    if (window.location.origin === {json.dumps(origin)}) {{
                         {"\n".join(js_items)}
                     }}
                 }} catch(e) {{}}

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Browser consistency probe</title></head>
+  <body>
+    <canvas id="probe" width="80" height="30"></canvas>
+    <script>
+      function snapshot() {
+        const canvas = document.getElementById("probe");
+        const context = canvas.getContext("2d");
+        context.fillStyle = "#246";
+        context.fillRect(2, 2, 40, 20);
+        context.fillStyle = "#fff";
+        context.fillText("probe", 5, 17);
+        return {
+          userAgent: navigator.userAgent,
+          platform: navigator.platform,
+          languages: Array.from(navigator.languages || []),
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          canvas: canvas.toDataURL(),
+          viewport: [innerWidth, innerHeight],
+          screen: [screen.width, screen.height],
+        };
+      }
+      window.browserProbe = snapshot;
+    </script>
+  </body>
+</html>
